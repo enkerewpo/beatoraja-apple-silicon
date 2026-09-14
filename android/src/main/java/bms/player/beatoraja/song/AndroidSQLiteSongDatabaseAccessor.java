@@ -1029,6 +1029,14 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
                 + "max INTEGER"
                 + ", PRIMARY KEY (path))");
 
+        // song.path 上的索引:增量检查("SELECT date FROM song WHERE path = ?")每个文件都要查一次,
+        // 没有索引就是全表扫描;上面的按 path 清理/去重同样依赖它。CREATE INDEX IF NOT EXISTS 是幂等的。
+        try {
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_song_path ON song(path)");
+        } catch (Throwable t) {
+            Log.w(TAG, "updateSongDatas: Failed to create idx_song_path", t);
+        }
+
         Log.i(TAG, "updateSongDatas: All tables verified. Starting scan with " + paths.length + " root paths");
 
         // 在所有扫描根目录下创建 .nomedia 文件
@@ -1111,6 +1119,13 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
                     }
                 }
                 preScanPathSnapshot = null; // 清空供下次扫描
+            }
+
+            // Step 3: 按 path 去重。写入点已经会清理同 path 的旧记录,这一步是兜底 ——
+            // 老版本写入时没做清理,库里可能已经积累了重复条目,光改写入逻辑救不了存量数据。
+            int dedupedCount = dedupeSongByPath(db);
+            if (dedupedCount > 0) {
+                Log.i(TAG, "Dedupe: removed " + dedupedCount + " duplicated song records");
             }
 
             long endTime = System.currentTimeMillis();
@@ -1446,6 +1461,87 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
     }
 
     /**
+     * 按 path 去重,清理历史遗留的重复条目(每个 path 只保留最新的一条)。
+     *
+     * 这是存量数据的兜底修复:老版本写入时没有清理同 path 的旧 sha256 记录,已经进库的
+     * 重复条目不会自己消失,只在写入点加清理救不了。这里在每次扫描结束后扫一遍,
+     * 把每个 path 只保留 adddate/rowid 最大的一条,其余删除。
+     *
+     * @return 删除的记录数
+     */
+    private int dedupeSongByPath(SQLiteDatabase db) {
+        long start = System.currentTimeMillis();
+        List<String> dupPaths = new ArrayList<>();
+        try (Cursor c = db.rawQuery(
+                "SELECT path FROM song WHERE path IS NOT NULL AND path <> '' GROUP BY path HAVING COUNT(*) > 1", null)) {
+            while (c.moveToNext()) {
+                String p = c.getString(0);
+                if (p != null && p.length() > 0) dupPaths.add(p);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "dedupeSongByPath: failed to query duplicated paths", t);
+            return 0;
+        }
+        if (dupPaths.isEmpty()) return 0;
+
+        int removed = 0;
+        db.beginTransactionNonExclusive();
+        try {
+            for (String path : dupPaths) {
+                // 先取出要保留的那一行的 rowid,再按 rowid 排除删除。
+                // 不能在 DELETE 的 WHERE 里对 song 表做子查询 —— 边删边求值,
+                // 一旦保留行先被删掉,后续子查询会返回别的值,可能把整个 path 删光。
+                // 用 rowid 而不是 sha256 做排除,还能避开 sha256 为 NULL 的行(NULL <> 'x' 为 NULL,删不掉)。
+                long keepRowId = -1;
+                try (Cursor c = db.rawQuery(
+                        "SELECT rowid FROM song WHERE path = ? ORDER BY adddate DESC, rowid DESC LIMIT 1",
+                        new String[]{path})) {
+                    if (c.moveToFirst()) keepRowId = c.getLong(0);
+                }
+                if (keepRowId < 0) continue;
+                // 保留 adddate 最大的一条;adddate 相同(同一秒内写入)时退化为 rowid 最大的,
+                // 即最后写入的那条 —— 它对应磁盘上当前的文件内容。其余全部删除。
+                removed += db.delete("song", "path = ? AND rowid <> ?",
+                        new String[]{path, String.valueOf(keepRowId)});
+            }
+            db.setTransactionSuccessful();
+        } catch (Throwable t) {
+            Log.e(TAG, "dedupeSongByPath: delete failed", t);
+        } finally {
+            db.endTransaction();
+        }
+        Log.i(TAG, "dedupeSongByPath: removed " + removed + " stale records from " + dupPaths.size()
+                + " duplicated paths in " + (System.currentTimeMillis() - start) + "ms");
+        return removed;
+    }
+
+    /**
+     * 删除同一 path 下 sha256 不同的陈旧记录。
+     *
+     * song 表的主键是 sha256(谱面文件内容的哈希),不是 path。修改谱面后内容变了 → sha256 变,
+     * insertWithOnConflict(CONFLICT_REPLACE) 只会按新的 sha256 做替换,同 path 的旧记录
+     * (旧 sha256) 既不被 REPLACE 命中,也不会被 Deletion Sync 清掉 —— Deletion Sync 只看
+     * 文件是否还在磁盘上,文件在的 path 一律判定为"仍然有效"。结果就是同一份谱面在库里
+     * 留下两条记录,选曲列表出现两个一模一样的谱面;反复修改会越积越多。
+     * 只有把整个文件夹删掉(文件不存在 → 两条一起被 Deletion Sync 删掉)再重新放入才会恢复,
+     * 这正是该 bug 表现出的"必须全删重扫才好"的原因。
+     *
+     * 因此写入前先按 path 清掉旧记录,保证一个 path 恒定只对应一条记录。
+     */
+    private int deleteStaleSongByPath(SQLiteDatabase db, String path, String sha256) {
+        if (path == null || path.length() == 0) return 0;
+        try {
+            if (sha256 != null) {
+                return db.delete("song", "path = ? AND sha256 <> ?", new String[]{path, sha256});
+            }
+            return db.delete("song", "path = ?", new String[]{path});
+        } catch (Throwable t) {
+            Log.w(TAG, "deleteStaleSongByPath failed for " + path, t);
+            return 0;
+        }
+    }
+
+    /**
      * 将SongData插入数据库
      */
     private void insertSongData(SongData songData, SQLiteDatabase db) {
@@ -1479,6 +1575,9 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
         cv.put("adddate", songData.getAdddate());
         cv.put("notes", songData.getNotes());
         cv.put("charthash", songData.getCharthash());
+        // 写入前清掉同 path 的旧 sha256 记录 —— 谱面被修改后 sha256 会变,
+        // 不清理会在库里留下同 path 的重复条目。详见 deleteStaleSongByPath 注释。
+        deleteStaleSongByPath(db, songData.getPath(), songData.getSha256());
         db.insertWithOnConflict("song", null, cv, SQLiteDatabase.CONFLICT_REPLACE);
     }
 
@@ -1971,6 +2070,10 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
             cv.put("adddate", songData.getAdddate());
             cv.put("notes", songData.getNotes());
             cv.put("charthash", songData.getCharthash());
+
+            // 写入前清掉同 path 的旧 sha256 记录 —— 谱面被修改后 sha256 会变,
+            // 不清理会在库里留下同 path 的重复条目。详见 deleteStaleSongByPath 注释。
+            deleteStaleSongByPath(db, pathName, songData.getSha256());
 
             try {
                 long result = db.insertWithOnConflict("song", null, cv, SQLiteDatabase.CONFLICT_REPLACE);

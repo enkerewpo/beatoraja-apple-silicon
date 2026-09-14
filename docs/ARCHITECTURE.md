@@ -440,8 +440,26 @@ AndroidLauncher
 4. 批量写入 SQLite。
 5. 更新选曲 Bar。
 
+### 11.1.1 song 表的主键约定与去重
+
+`song` 表主键是 `sha256`（谱面文件内容的哈希），**不是** `path`。修改谱面会改变 sha256，
+`CONFLICT_REPLACE` 命中不了，新记录插入后同 path 的旧记录不会消失，选曲列表就会出现重复条目。
+
+写入前必须先调 `deleteStaleSongByPath(db, path, sha256)` 清掉同 path 的旧记录；
+扫描结束后由 `dedupeSongByPath(db)` 兜底清理存量重复（每个 path 只保留 adddate/rowid 最大的一条）。
+
+两个 SQLite 陷阱：
+
+- 不要在 `DELETE` 的 WHERE 里对 `song` 表做子查询 —— 边删边求值，保留行一旦先被删掉，
+  后续子查询会返回别的值，可能把整个 path 删光。必须先 SELECT 出要保留的 rowid，
+  再 `DELETE ... WHERE rowid <> ?`。
+- 用 `rowid` 而不是 `sha256` 做排除：TEXT 主键允许 NULL，`NULL <> 'x'` 求值为 NULL，那一行删不掉。
+
+详见 `docs/songdb-duplicate-chart-fix.md`。
+
 数据库访问涉及 GL 线程、扫描线程和结果保存线程。修改 SQL 或锁策略前，应先阅读：
 
+- `docs/songdb-duplicate-chart-fix.md`
 - `docs/score-database-refactor-plan.md`
 - `docs/musicresult-thread-analysis.md`
 - `docs/result-freeze-fix.md`
