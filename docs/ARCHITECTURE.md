@@ -346,6 +346,20 @@ LockSupport.parkNanos(...)
 - `AndroidLauncher.createAudio()`
 - `PlayerResource` 和按键音加载路径
 
+### 9.1.1 AudioDriver 的锁约定
+
+`AbstractAudioDriver.setModel()` 会整体替换 `wavmap` / `slicesound` 并 `disposeOld()` 释放旧
+PCM。Android 上 PCM 是 native 对象（libgdx-oboe `OboeSound`），所以：
+
+- `play(Note, float, int)` 与 `stop(Note)` 必须和 `setModel()` 共用同一把 monitor（都已
+  `synchronized`）。无锁并发会变成 native use-after-free / SIGSEGV。
+- **任何换模型的调用方都必须在 `setModel()` 之前**先停掉播放线程并 `audio.stop((Note) null)`。
+  只靠 monitor 不够 —— 混音器里排队中的 sample 不会因为 Java 侧加锁而停下。
+- `setModel()` 会占住锁做完整解码（几百毫秒～数秒），不要在 GL 线程的高频路径上依赖它。
+
+MusicPlayer（后台 autoplay）是唯一在后台线程换模型的状态，其交接协议与后台断音 / 闪退的
+修复细节见 `docs/musicplayer-background-fix.md`。
+
 ### 9.2 频谱
 
 ```text
@@ -488,11 +502,16 @@ Download/beatoraja/
 | 歌曲扫描固定线程池 | 并行谱面解码 |
 | 结果页后台线程 | IR、成绩或资源相关任务 |
 | 截图线程 | 像素后处理与文件导出 |
+| `MusicPlayer-Worker` | MusicPlayer 的自动切歌监视（单线程，与手工切歌共用 `synchronized(this)`） |
+| `MusicPlayer-BGAutoplay` | MusicPlayer 的 BG 音轨调度（每首歌一个，daemon） |
 | Choreographer callback | 提供最新 VSync 相位 |
 
 注意事项：
 
-- 不要在后台线程直接操作 OpenGL 资源。
+- 不要在后台线程直接操作 OpenGL 资源。GL 上下文在切后台后会被重建，失效的 `Texture`
+  **不是 null**，`== null` 判据重载不了它 —— 要在 `resume()` 里无条件释放重建。
+- 后台线程上的长时间任务不要用 wall clock（`System.currentTimeMillis()`）推进时间，
+  改用 `System.nanoTime()`；并且要处理"被系统饿过"之后的追赶，不能一次性补播积压任务。
 - SQLite 写入和结果页切换存在历史卡顿问题，改动前先检查专题文档和测试。
 - 当前输入轮询线程是无限循环，`MainController.dispose()` 没有显式停止它。
 - 状态切换会清理模拟按键，防止上一状态的输入泄漏。

@@ -467,7 +467,16 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 		progress.set(noteMapSize);
 	}
 
-	public void play(Note n, float volume, int pitch) {
+	/**
+	 * キー音再生。
+	 *
+	 * synchronized の理由:{@link #play0} / {@link #stop(Note)} は wavmap / slicesound を
+	 * 素読みするのに対し、{@link #setModel} はそれらを丸ごと差し替えて古い PCM を解放する。
+	 * 無保護だと「再生スレッドが古い PCM を掴んだ直後に setModel が native 側を解放」が起き、
+	 * Oboe のような native 音源では use-after-free (SIGSEGV) になる。
+	 * setModel と同じモニタを取ることでこの競合を構造的に潰す。
+	 */
+	public synchronized void play(Note n, float volume, int pitch) {
 		play0(n, this.volume * volume, pitch);
 		for (Note ln : n.getLayeredNotes()) {
 			play0(ln, this.volume * volume, pitch);
@@ -524,7 +533,12 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 		}
 	}
 
-	public void stop(Note n) {
+	/**
+	 * キー音停止。synchronized の理由は {@link #play(Note, float, int)} と同じ。
+	 * 特に {@code stop(null)} は wavmap / slicesound を全走査するため、
+	 * {@link #setModel} の差し替えと並走すると解放済み PCM を触る危険が最も高い。
+	 */
+	public synchronized void stop(Note n) {
 		try {
 			if (n == null) {
 				for (T s : wavmap) {
