@@ -48,7 +48,11 @@ public class PreviewMusicProcessor {
         if (song == null) {
             start("");
         } else {
-            String p = song.getPreview();
+            // 必须用解析后的绝对路径:#PREVIEW 定义的是相对谱面目录的文件名,
+            // 直接拿去 new File() 会按进程工作目录解析,exists() 恒为 false 而静默
+            // 回退到默认 BGM —— 这就是"写了 #PREVIEW 反而没声音"的原因。
+            // 旧库里已存成相对名的记录也靠这里兜住,不需要重新 update song。
+            String p = song.getPreviewPath();
             // 验证预览路径是否有效
             if (p != null && p.length() > 0) {
                 java.io.File file = new java.io.File(p);

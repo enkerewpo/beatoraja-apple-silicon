@@ -1,5 +1,6 @@
 package bms.player.beatoraja.song;
 
+import java.io.File;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -156,7 +157,11 @@ public class SongData implements Validatable, IpfsInformation {
 		setStagefile(model.getStagefile());
 		setBackbmp(model.getBackbmp());
         if(preview == null || preview.length() == 0) {
-            setPreview(model.getPreview());
+            // #PREVIEW 是相对谱面目录的文件名,入库前解析成绝对路径,避免播放侧按
+            // 进程工作目录解析而找不到文件。解析不出(谱面路径未知)时保留原值。
+            String p = model.getPreview();
+            String resolved = resolvePreviewPath(model.getPath(), p);
+            setPreview(resolved != null ? resolved : (p != null ? p : ""));
         }
 		try {
 			level = Integer.parseInt(model.getPlaylevel());
@@ -490,6 +495,48 @@ public class SongData implements Validatable, IpfsInformation {
 
 	public void setPreview(String preview) {
 		this.preview = preview;
+	}
+
+	/**
+	 * 可直接交给 AudioDriver 播放的预览音频绝对路径。
+	 *
+	 * <p>{@code preview} 字段同时存在两种语义:BMS 的 {@code #PREVIEW} 定义的是
+	 * <b>相对谱面所在目录的文件名</b>(BMSDecoder 原样保存,只做了反斜杠替换),
+	 * 而扫描目录时自动发现的 {@code preview.*} 存的是<b>绝对路径</b>。
+	 * 播放侧若把相对名直接丢给 AudioDriver,会按进程工作目录解析而找不到文件 ——
+	 * 表现就是"定义了 #PREVIEW 反而没声音,不定义只放文件却能播"。
+	 * 这里统一按谱面所在目录补全相对路径;已是绝对路径时原样返回。
+	 *
+	 * @return 绝对路径;preview 为空时返回 null
+	 */
+	public String getPreviewPath() {
+		return resolvePreviewPath(getPath(), preview);
+	}
+
+	/**
+	 * 把 BMS 里定义的(相对)预览文件名解析为绝对路径。
+	 *
+	 * @param songPath 谱面文件的绝对路径,可为 null
+	 * @param preview  {@code #PREVIEW} 的值,可为 null
+	 * @return 绝对路径;无法解析时返回 null
+	 */
+	public static String resolvePreviewPath(String songPath, String preview) {
+		if (preview == null || preview.length() == 0) {
+			return null;
+		}
+		final String p = preview.replace('\\', '/');
+		File f = new File(p);
+		if (!f.isAbsolute()) {
+			if (songPath == null) {
+				return null;
+			}
+			File dir = new File(songPath).getParentFile();
+			if (dir == null) {
+				return null;
+			}
+			f = new File(dir, p);
+		}
+		return f.getAbsolutePath();
 	}
 
 	public SongInformation getInformation() {

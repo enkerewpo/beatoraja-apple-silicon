@@ -1956,9 +1956,17 @@ public class AndroidSQLiteSongDatabaseAccessor implements SongDatabaseAccessor {
             SongData songData = new SongData(model, txt);
             songData.setPath(pathName);
 
-            // 如果没有 preview 且存在 preview 文件，设置为 preview
-            if ((songData.getPreview() == null || songData.getPreview().length() == 0) && previewPath != null) {
+            // #PREVIEW 定义的是相对谱面目录的文件名，SongData 构造时已按 model.getPath()
+            // 归一化为绝对路径。这里按最终 pathName 再兜一次，并做存在性校验：
+            // 解析结果确实不存在（#PREVIEW 文件名写错 / 文件缺失）时，回退到扫描目录时
+            // 自动发现的 preview 文件；两者都没有则沿用原值，播放侧会再判一次并回退默认 BGM。
+            String resolvedPreview = SongData.resolvePreviewPath(pathName, songData.getPreview());
+            if (resolvedPreview != null && new File(resolvedPreview).exists()) {
+                songData.setPreview(resolvedPreview);
+            } else if (previewPath != null) {
                 songData.setPreview(previewPath);
+            } else if (resolvedPreview == null && songData.getPreview() == null) {
+                songData.setPreview("");
             }
 
             // 保持 tag/favorite
