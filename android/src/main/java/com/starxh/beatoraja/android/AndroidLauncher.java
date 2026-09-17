@@ -2,6 +2,8 @@ package com.starxh.beatoraja.android;
 
 import android.Manifest;
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -56,6 +58,19 @@ import bms.player.beatoraja.PlayerConfig;
 import bms.player.beatoraja.BMSPlayerMode;
 
 public class AndroidLauncher extends AndroidApplication {
+
+	/** 记录"上次完成 assets 落盘时的 versionCode"的 SharedPreferences */
+	private static final String PREFS_ASSET_VERSION = "asset_version";
+	private static final String KEY_INSTALLED_VERSION_CODE = "installed_version_code";
+	/**
+	 * 版本更新后为 true：本次启动对 APK assets 落盘的内置皮肤（assets/skin →
+	 * filesDir/skin，含 GenericTheme 的 Lua/JS 等代码文件）执行覆盖拷贝，
+	 * 解决"用户更新版本但 filesDir/skin 里还是旧版皮肤"的问题。
+	 * 只覆盖 skin：sound/bgm/默认歌曲/字体允许用户定制，保持补缺语义。
+	 * walkure 等 WebView/Gdx.files.internal 直读资源不落盘，天然随 APK 更新。
+	 * 在 onCreate 主线程计算，ZipExtractor 后台线程只读，volatile 保证可见性。
+	 */
+	private volatile boolean forceAssetsOverwrite;
 
 	/** 硬件最大刷新率，MainController 通过反射读取 */
 	public static float maxRefreshRate = 60f;
@@ -326,6 +341,12 @@ public class AndroidLauncher extends AndroidApplication {
         String root = filesDir.getAbsolutePath();
         System.setProperty("beatoraja.root", root);
 
+        // 版本更新检测：APK versionCode 与上次记录不同(含首次安装)时,本次启动对
+        // 内置皮肤(assets/skin)执行覆盖拷贝——解决"用户更新了版本,但 filesDir/skin
+        // 里的皮肤(如 GenericTheme 代码文件)还是旧版"的问题。
+        // 必须在 createDefaultDirectories() 和 ZipExtractor 线程启动之前完成计算。
+        forceAssetsOverwrite = detectAndRecordVersionUpdate();
+
         // 首次启动时创建必要的目录
         createDefaultDirectories();
 
@@ -502,7 +523,8 @@ public class AndroidLauncher extends AndroidApplication {
             Log.i(TAG, "Created songs directory: " + songsDir.getAbsolutePath());
         }
 
-        // 第一次启动时，将 assets 中的 inochi_ogg 复制到默认歌曲目录
+        // 第一次启动时，将 assets 中的 inochi_ogg 复制到默认歌曲目录。
+        // 保持补缺语义不随版本覆盖：用户可能对默认歌曲目录做过整理
         File inochiDir = new File(songsDir, "inochi_ogg");
         if (!inochiDir.exists()) {
             Log.i(TAG, "First run: Copying inochi_ogg from assets to " + inochiDir.getAbsolutePath());
@@ -558,7 +580,9 @@ public class AndroidLauncher extends AndroidApplication {
         // 先把 APK assets 里的内置皮肤(GenericTheme、default 等)落到 filesDir/skin/,
         // 再 overlay 用户从 Download/beatoraja/skins/ 导入的皮肤。
         // 否则只要用户放了任何外部皮肤,内置皮肤就会被跳过、列表里消失。
-        // copyAssetFolder 内部对每个子项做 if (!destSub.exists()) 检查,所以这里重复调用是安全的。
+        // 平时 copyAssetFolder 按子项 if (!destSub.exists()) 补缺,重复调用安全;
+        // 版本更新(forceAssetsOverwrite)时改为覆盖拷贝,内置皮肤跟随 APK 更新,
+        // 但只覆盖 assets 里存在的同名文件,用户自行导入的皮肤不受影响。
         ensureSkinAssets(filesDir);
         ensureExternalResourceImport(externalSkinsDir, internalSkinDir, "skin");
     }
@@ -591,6 +615,7 @@ public class AndroidLauncher extends AndroidApplication {
      * 把 APK assets/sound/default/ 拷到 filesDir/sound/default/。
      * 与 ensureSkinAssets 同模式:无早退出,每次启动都调用,copyAssetFolder 内部按子项
      * if (!destSub.exists()) 跳过已有文件,所以是幂等的"补缺"语义。
+     * 注意:不做版本覆盖——sound 允许用户定制,覆盖会冲掉用户的修改。
      */
     private void ensureSoundAssets(File filesDir) {
         File soundDefaultDir = new File(filesDir, "sound/default");
@@ -881,31 +906,68 @@ public class AndroidLauncher extends AndroidApplication {
     private void ensureSkinAssets(File filesDir) {
         File skinDir = new File(filesDir, "skin");
         skinDir.mkdirs();
-        copyAssetFolder(getAssets(), "skin", skinDir);
+        copyAssetFolder(getAssets(), "skin", skinDir, forceAssetsOverwrite);
     }
 
+    /**
+     * 版本更新检测：把当前 APK 的 versionCode 与 SharedPreferences 里记录的上次值比较。
+     * 不同（含首次安装时无记录）则返回 true 并更新记录——调用方据此对内置皮肤
+     * （assets/skin）执行覆盖拷贝。仅应在 onCreate 主线程调用一次。
+     */
+    private boolean detectAndRecordVersionUpdate() {
+        long versionCode = 0;
+        try {
+            PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
+            versionCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                    ? pi.getLongVersionCode() : pi.versionCode;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to read versionCode, assets overwrite check defaults to no-op: " + e.getMessage());
+            return false;
+        }
+        SharedPreferences sp = getSharedPreferences(PREFS_ASSET_VERSION, Context.MODE_PRIVATE);
+        long installed = sp.getLong(KEY_INSTALLED_VERSION_CODE, -1);
+        boolean changed = installed != versionCode;
+        if (changed) {
+            sp.edit().putLong(KEY_INSTALLED_VERSION_CODE, versionCode).apply();
+            Log.i(TAG, "Version change detected: previous=" + installed + " current=" + versionCode
+                    + " -> overwrite-extracting built-in skins");
+        }
+        return changed;
+    }
+
+    /** 兼容旧调用：不覆盖已存在文件（补缺语义） */
     private void copyAssetFolder(AssetManager am, String srcPath, File destDir) {
+        copyAssetFolder(am, srcPath, destDir, false);
+    }
+
+    private void copyAssetFolder(AssetManager am, String srcPath, File destDir, boolean overwrite) {
         try {
             String[] assets = am.list(srcPath);
             if (assets == null || assets.length == 0) {
-                copyAssetFile(am, srcPath, new File(destDir, new File(srcPath).getName()));
+                copyAssetFile(am, srcPath, new File(destDir, new File(srcPath).getName()), overwrite);
                 return;
             }
             for (String asset : assets) {
                 String src = srcPath + "/" + asset;
                 File destSub = new File(destDir, asset);
-                if (!destSub.exists()) {
-                    if (asset.contains(".") && !asset.endsWith("/")) copyAssetFile(am, src, destSub);
-                    else {
-                        destSub.mkdirs();
-                        copyAssetFolder(am, src, destSub);
-                    }
+                boolean isDir = !(asset.contains(".") && !asset.endsWith("/"));
+                if (isDir) {
+                    destSub.mkdirs();
+                    copyAssetFolder(am, src, destSub, overwrite);
+                } else if (overwrite || !destSub.exists()) {
+                    copyAssetFile(am, src, destSub, overwrite);
                 }
             }
         } catch (IOException e) { Log.w(TAG, "Asset copy fail: " + srcPath + " - " + e.getMessage()); }
     }
 
+    /** 兼容旧调用：不覆盖已存在文件（补缺语义） */
     private void copyAssetFile(AssetManager am, String srcPath, File destFile) {
+        copyAssetFile(am, srcPath, destFile, false);
+    }
+
+    private void copyAssetFile(AssetManager am, String srcPath, File destFile, boolean overwrite) {
+        // 覆盖模式下源文件缺失仍会抛 IOException，但逐文件 try-catch 保证单个失败不影响其余文件
         try (InputStream is = am.open(srcPath);
              FileOutputStream fos = new FileOutputStream(destFile)) {
             byte[] buf = new byte[8192];
