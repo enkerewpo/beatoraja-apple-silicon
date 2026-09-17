@@ -201,6 +201,14 @@ public class PreviewMusicProcessor {
                 } catch (Exception e) {
                     java.util.logging.Logger.getGlobal().warning("Failed to stop preview: " + e.getMessage());
                 }
+                // 内存回收:preview 停止后立即释放其解码 PCM(soundmap 条目 + native 缓冲)。
+                // 否则每浏览一首歌就有一份 preview PCM 常驻 native 堆直到进程退出。
+                // 下次选中同一首歌时 getSound() 会自动重新解码,代价可接受。
+                try {
+                    audio.dispose(playing);
+                } catch (Exception e) {
+                    java.util.logging.Logger.getGlobal().warning("Failed to dispose preview: " + e.getMessage());
+                }
             }
         }
     }
