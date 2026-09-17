@@ -880,7 +880,7 @@ public class MusicPlayer extends MainState {
 		Texture tex = getWhiteTexture();
 		if (tex == null) return;
 		batch.begin();
-		batch.setColor(0.05f, 0.06f, 0.10f, 1f);
+		batch.setColor(0f, 0f, 0f, 1f); // 纯黑背景
 		batch.draw(tex, 0, 0, skinW, skinH);
 		batch.end();
 	}
@@ -1078,7 +1078,7 @@ public class MusicPlayer extends MainState {
 		Texture tex = getWhiteTexture();
 		batch.begin();
 		if (tex != null) {
-			batch.setColor(0.20f, 0.22f, 0.30f, 0.9f);
+			batch.setColor(0f, 0f, 0f, 1f); // 纯黑背景
 			for (int i = 0; i < 4; i++) {
 				float x = startX + i * (BTN_SIZE + BTN_GAP);
 				batch.draw(tex, x, y, BTN_SIZE, BTN_SIZE);
