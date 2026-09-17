@@ -121,7 +121,17 @@ tr:nth-child(even) td{background:var(--row-alt)}
 .lamp-easy{color:#1ff00c}
 .lamp-normal{color:#ebfc05}
 .lamp-hard{color:#f7f3f2}
-.lamp-fullCombo,.lamp-fc{color:#1bdbf5}
+/* FULL COMBO 彩虹字：渐变背景裁剪到文字，暗/亮色各配一版保证可读 */
+.lamp-fullCombo,.lamp-fc{
+  background:linear-gradient(90deg,#ff6b6b,#ffb347,#ffe94d,#5eff8a,#4dc3ff,#b38aff,#ff7ad9);
+  -webkit-background-clip:text;background-clip:text;
+  color:transparent;-webkit-text-fill-color:transparent;
+}
+body.theme-light .lamp-fullCombo,body.theme-light .lamp-fc{
+  background:linear-gradient(90deg,#d63031,#e17055,#b8860b,#00a05a,#0984c9,#6c5ce7,#d63384);
+  -webkit-background-clip:text;background-clip:text;
+  color:transparent;-webkit-text-fill-color:transparent;
+}
 body.theme-light .lamp-normal{color:#a07d00}
 body.theme-light .lamp-hard{color:#b35900}
 .empty-msg{text-align:center;padding:30px 16px;color:var(--muted);font-size:14px}
