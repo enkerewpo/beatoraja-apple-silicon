@@ -41,8 +41,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.HashSet;
 import java.util.Set;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.graphics.Rect;
@@ -336,10 +334,17 @@ public class AndroidLauncher extends AndroidApplication {
         // checkAndExtractSongZips() 是公开静态入口,后续 SettingsActivity 可以重新触发
         final File filesDirForExtract = filesDir;
         new Thread(() -> {
-            ensureExternalSkinZip(filesDirForExtract);
-            ensureExternalBgmZip(filesDirForExtract);
-            ensureExternalSoundZip(filesDirForExtract);
-            ensureExternalSongZip();
+            // 顶层兜底：这里是普通 Thread，任何未捕获异常都会杀掉整个进程（实测过一次
+            // ZipCoder 抛 unchecked 的 IllegalArgumentException 把 App 打崩）。
+            // 导入失败只应表现为"这次没导进去"，不该让用户丢进程。
+            try {
+                ensureExternalSkinZip(filesDirForExtract);
+                ensureExternalBgmZip(filesDirForExtract);
+                ensureExternalSoundZip(filesDirForExtract);
+                ensureExternalSongZip();
+            } catch (Throwable t) {
+                Log.e(TAG, "Resource import failed", t);
+            }
         }, "ZipExtractor").start();
 
         Config.updateConfigPath();
@@ -642,6 +647,23 @@ public class AndroidLauncher extends AndroidApplication {
             hasProcessed = true;
         }
 
+        // 补一次对 internalDir 里残留 zip 的重试。
+        // 上面的流程是"把外部 zip 搬进 internalDir 再解压"；一旦解压失败（编码异常、进程被杀、
+        // 空间不足…）zip 就留在 internalDir，而外部目录里已经没有它了 —— 只扫外部目录的话
+        // 用户只能重新拷贝一份进来。解压成功后 zip 必被删除，所以"internalDir 里还有 zip"
+        // 等价于"上次没成功"，重试是安全且有意义的。
+        File[] staleZips = internalDir.listFiles((dir, name) -> name.toLowerCase().endsWith(".zip"));
+        if (staleZips != null && staleZips.length > 0) {
+            for (File stale : staleZips) {
+                Log.i(TAG, "Retrying leftover " + logTag + " zip: " + stale.getName());
+                if (extractZip(stale, internalDir)) {
+                    stale.delete();
+                    Log.i(TAG, "Deleted leftover " + logTag + " zip after extract: " + stale.getName());
+                }
+            }
+            hasProcessed = true;
+        }
+
         File[] folders = externalDir.listFiles(File::isDirectory);
         if (folders != null && folders.length > 0) {
             for (File folder : folders) {
@@ -701,8 +723,12 @@ public class AndroidLauncher extends AndroidApplication {
                 }
             }
             return true;
-        } catch (IOException e) {
+        } catch (Exception e) {
+            // 必须是 Exception 而不是 IOException：条目名解码失败时 ZipCoder 抛的是
+            // IllegalArgumentException(unchecked)，漏掉它就等于让后台线程带异常死掉 → 进程被杀。
             Log.e(TAG, "Failed to extract zip: " + zipFile.getName(), e);
+            // 解到一半的目录会让下次启动被判成"已解压完成"而跳过重试，清掉它以便重试
+            deleteRecursive(extractDir);
             return false;
         }
     }
@@ -771,31 +797,23 @@ public class AndroidLauncher extends AndroidApplication {
                 }
             }
             return true;
-        } catch (IOException e) {
+        } catch (Exception e) {
+            // 同 extractZip()：条目名解码失败抛的是 unchecked 的 IllegalArgumentException，
+            // 只 catch IOException 会让后台线程死掉 → 进程被杀。歌曲包同样会遇到这种 zip。
             Log.e(TAG, "Failed to extract song zip: " + zipFile.getName(), e);
+            deleteRecursive(destDir);
             return false;
         }
     }
 
+    /**
+     * 打开 zip。条目名编码由 {@link ZipCharsetSupport} 逐个候选试出来 —— 不能只按设备语言
+     * 猜一次：猜错时 {@code ZipCoder.toString()} 抛的是被包成 <b>unchecked
+     * IllegalArgumentException</b> 的 {@code MalformedInputException}，{@code catch
+     * (IOException)} 抓不到，会逃出后台线程直接杀进程。
+     */
     private java.util.zip.ZipFile openZipFile(File file) throws IOException {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            return new java.util.zip.ZipFile(file, getZipCharset());
-        } else {
-            return new java.util.zip.ZipFile(file);
-        }
-    }
-
-    private Charset getZipCharset() {
-        String language = Locale.getDefault().getLanguage();
-        try {
-            if ("ja".equals(language)) {
-                return Charset.forName("MS932");
-            } else if ("zh".equals(language)) {
-                return Charset.forName("GBK");
-            }
-        } catch (Exception ignored) {
-        }
-        return StandardCharsets.UTF_8;
+        return ZipCharsetSupport.open(file);
     }
 
     private String findCommonZipPrefix(java.util.zip.ZipFile zip) {

@@ -504,20 +504,25 @@ public abstract class SkinObject extends DisposableObject {
 	}
 
 	public void prepare(long time, MainState state, float offsetX, float offsetY) {
-		for (BooleanProperty draw : dstdraw) {
-			if(!draw.get(state)) {
-				this.draw = false;
-				return;
+		// dstdraw 只决定 draw 标志，**不能在这里提前 return**：
+		// 提前返回会跳过末尾的 prepareColor()，color 停在字段初始值 new Color()=(0,0,0,0)；
+		// 而被调用方无视 draw 标志直接绘制的元素（BarRenderer 的 bar 文字）会被
+		// draw() 的 color.a==0f 守卫静默跳过 —— 实测表现为"换皮肤后整列歌单标题消失，
+		// 直到该绘制条件某帧成立过一次为止"。
+		boolean visible = true;
+		for (BooleanProperty d : dstdraw) {
+			if (!d.get(state)) {
+				visible = false;
+				break;
 			}
 		}
-		draw = true;
+		draw = visible;
 		prepareRegion(time, state);
 		region.x += offsetX;
 		region.y += offsetY;
 		if (mouseRect != null && !mouseRect.contains(state.main.getInputProcessor().getMouseX() -region.x,
 				state.main.getInputProcessor().getMouseY() - region.y)) {
 			draw = false;
-			return;
 		}
 
 		// 注意：不要把"视口裁剪"放在这里。
@@ -527,10 +532,8 @@ public abstract class SkinObject extends DisposableObject {
 		// （SkinImage / SkinNumber 是在各自的 prepare(..., offsetX, offsetY) 里加偏移，所以
 		// 它们的 region 已经是最终坐标，看起来"正常"；SkinText 不是，两者行为因此分裂。）
 		//
-		// 在这里按 region 裁剪，会把 bar 标题整列误判成视口外：draw=false，且 prepareColor()
-		// 从此不执行，color 停在初始值 new Color()=(0,0,0,0)，于是 draw() 的 color.a==0f
-		// 守卫直接 return —— 表现为"整列歌单标题不显示，但背景条和等级数字都正常"。
-		// 正确位置是真正知道最终坐标的 draw 辅助方法，见 checkViewport()。
+		// 在这里按 region 裁剪，会把 bar 标题整列误判成视口外；正确位置是真正知道最终坐标的
+		// draw 辅助方法，见 checkViewport()。
 		prepareColor();
 		prepareAngle();
 	}

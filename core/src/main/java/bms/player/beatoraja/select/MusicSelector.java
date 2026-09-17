@@ -27,6 +27,7 @@ import bms.player.beatoraja.input.KeyCommand;
 import bms.player.beatoraja.input.KeyBoardInputProcesseor.ControlKeys;
 import bms.player.beatoraja.ir.*;
 import bms.player.beatoraja.select.bar.*;
+import bms.player.beatoraja.skin.Skin;
 import bms.player.beatoraja.skin.SkinLoader;
 import bms.player.beatoraja.skin.SkinType;
 import bms.player.beatoraja.skin.property.EventFactory.EventType;
@@ -73,6 +74,12 @@ public final class MusicSelector extends MainState {
 	private MusicSelectInputProcessor musicinput;
 
 	private SearchTextField search;
+
+	/**
+	 * 搜索框（原生 EditText）是按哪个皮肤实例创建的。{@code loadSkin()} 每次都会
+	 * new 出一个新的 Skin 对象，用它识别"皮肤换了"。
+	 */
+	private Skin searchFieldSkin;
 
 	/**
 	 * 楽曲が選択されてからbmsを読み込むまでの時間(ms)
@@ -197,18 +204,9 @@ public final class MusicSelector extends MainState {
 
 		loadSkin(SkinType.MUSIC_SELECT);
 
-		// search text field
-		if (getSkin() instanceof MusicSelectSkin) {
-			Rectangle searchRegion = ((MusicSelectSkin) getSkin()).getSearchTextRegion();
-			if (searchRegion != null && (getStage() == null ||
-					(search != null && !searchRegion.equals(search.getSearchBounds())))) {
-				if (search != null) {
-					search.dispose();
-				}
-				search = new SearchTextField(this, resource.getConfig().getResolution());
-				setStage(search);
-			}
-		}
+		// search text field（按当前皮肤同步原生输入框；
+		// 真正的逻辑在 syncSearchTextField()，换皮肤时由 setSkin() 触发，这里幂等）
+		syncSearchTextField();
 
 		if (manager.getSelected() == null) {
 			// 避免直接同步调用，先显示缓存的内容，防止阻塞
@@ -222,6 +220,40 @@ public final class MusicSelector extends MainState {
 		// call is non-blocking even though we run it from the GL thread here.
 		if (!songUpdated && main.getPlayerResource().getConfig().isUpdatesong()) {
 			main.updateSong(null);
+		}
+	}
+
+	/**
+	 * 换皮肤时重建原生搜索框。位置由皮肤决定，而且 {@code MainController.changeState}
+	 * 对 MUSICSELECT 只在首次进入时调 {@link #create()}、之后只 {@code loadSkin()} ——
+	 * 不同步的话，旧皮肤的原生 EditText 会留在旧皮肤的位置上（实测：LR2 皮肤 →
+	 * VibeCity，"search song" 提示文字停在 MISS COUNT 旁边）。
+	 */
+	@Override
+	public void setSkin(Skin skin) {
+		super.setSkin(skin);
+		syncSearchTextField();
+	}
+
+	/** 按当前皮肤同步原生搜索框：换皮肤必重建；新皮肤没有搜索框区域则移除。 */
+	private void syncSearchTextField() {
+		Skin skin = getSkin();
+		if (!(skin instanceof MusicSelectSkin) || searchFieldSkin == skin) {
+			return;    // 每帧都可能走到这里（prepare/各处触发），同一皮肤只同步一次
+		}
+		searchFieldSkin = skin;
+
+		if (search != null) {
+			// 皮肤换了：旧输入框的位置/存在性都不可信，直接重建。
+			// MainController.render() 与输入注册对 null stage 均有判断，置 null 是安全的。
+			search.dispose();
+			search = null;
+			setStage(null);
+		}
+		Rectangle searchRegion = ((MusicSelectSkin) skin).getSearchTextRegion();
+		if (searchRegion != null) {
+			search = new SearchTextField(this, resource.getConfig().getResolution());
+			setStage(search);
 		}
 	}
 
