@@ -1,5 +1,6 @@
 package bms.player.beatoraja.skin.lua;
 
+import com.badlogic.gdx.Gdx;
 import com.badlogic.gdx.files.FileHandle;
 
 import org.luaj.vm2.Globals;
@@ -13,10 +14,10 @@ import org.luaj.vm2.LuaValue;
 import org.luaj.vm2.lib.OneArgFunction;
 import org.luaj.vm2.lib.ResourceFinder;
 import org.luaj.vm2.lib.TwoArgFunction;
+import org.luaj.vm2.lib.jse.AndroidBindClassBridge;
 import org.luaj.vm2.lib.jse.JsePlatform;
 
 import java.io.File;
-import java.lang.reflect.Method;
 import java.util.function.Function;
 import java.util.logging.Logger;
 
@@ -551,41 +552,88 @@ public class SkinLuaAccessor {
 
 	/**
 	 * Android で luajava.bindClass が APK 内のクラス（com.badlogic.gdx.Gdx 等）を
-	 * 見つけられるように、package.preload.luajava をラップして bindClass を
-	 * アプリの ClassLoader を使うようにカスタマイズする。
+	 * 見つけられるように、luajava テーブルの bindClass をアプリの ClassLoader を
+	 * 使うように差し替える。
+	 *
+	 * <p><b>为什么要把三个位置都覆盖掉</b>：原来的实现只去找
+	 * {@code package.preload.luajava}，但 luaj 的 {@code LuajavaLib} 是把 luajava 表
+	 * 注册到<b>全局变量</b>和 {@code package.loaded.luajava} 上的，preload 里根本
+	 * 没有这个东西 —— 于是取到 nil 就直接 return，<b>整段包装从来没生效过</b>。
+	 * 表现就是脚本里那句
+	 * {@code vm error: java.lang.ClassNotFoundException: com.badlogic.gdx.Gdx}：
+	 * 拿到的是 luaj 原始的 bindClass，它用 JVM 默认的 ClassLoader，
+	 * 在 Android 上找不到 APK 里的类。</p>
+	 *
+	 * <p>兜底仍然保留：任何一步失败都回退到原始 bindClass，不会比现状更差。</p>
 	 */
 	private void customizeLuajavaClassLoading() {
 		try {
-			LuaValue pkg = globals.get("package");
-			final LuaValue originalPreload = pkg.get("preload").get("luajava");
-			if (originalPreload.isnil() || !originalPreload.isfunction()) return;
 			final ClassLoader appClassLoader = SkinLuaAccessor.class.getClassLoader();
-			pkg.get("preload").set("luajava", new TwoArgFunction() {
-				@Override
-				public LuaValue call(LuaValue modname, LuaValue env) {
-					LuaValue module = originalPreload.call(modname, env);
-					if (module.istable()) {
-						LuaTable lj = (LuaTable) module;
-						final LuaValue origBindClass = lj.get("bindClass");
-						lj.set("bindClass", new OneArgFunction() {
-							@Override
-							public LuaValue call(LuaValue className) {
-								try {
-									Class<?> cls = Class.forName(className.tojstring(), true, appClassLoader);
-									Method m = Class.forName("org.luaj.vm2.lib.jse.JavaClass")
-											.getMethod("forClass", Class.class);
-									return (LuaValue) m.invoke(null, cls);
-								} catch (Exception e) {
-									return origBindClass.call(className);
-								}
-							}
-						});
-					}
-					return module;
-				}
-			});
-		} catch (Exception e) {
-			Logger.getGlobal().warning("Failed to configure luajava: " + e.getMessage());
+			int wrapped = 0;
+			// 脚本写 luajava.bindClass(...) 时用的是全局那一份。
+			wrapped += wrapLuajavaBindClass(globals.get("luajava"), appClassLoader);
+			LuaValue pkg = globals.get("package");
+			if (pkg.istable()) {
+				// 脚本写 require("luajava").bindClass(...) 时用的是 package.loaded 那一份。
+				wrapped += wrapLuajavaBindClass(pkg.get("loaded").get("luajava"), appClassLoader);
+				// 某些版本/用法会从 preload 里取,一并覆盖(原来只找了这里,而它是 nil)。
+				wrapped += wrapLuajavaBindClass(pkg.get("preload").get("luajava"), appClassLoader);
+			}
+			// 这行是排查用的:logcat 里没有它 = 这段代码根本没跑到;
+			// 有它但数字是 0 = 三个位置都没找到 luajava 表(luaj 版本差异)。
+			// 两种情况都会让脚本退回原始 bindClass,继续报 ClassNotFoundException。
+			logInfo("luajava bindClass wrapped at " + wrapped + " site(s), appLoader="
+					+ (appClassLoader == null ? "null" : appClassLoader.getClass().getName()));
+		} catch (Throwable e) {
+			logWarn("Failed to configure luajava: " + e);
 		}
+	}
+
+	/**
+	 * 把一张 luajava 表里的 bindClass 换成走 app ClassLoader 的版本。
+	 *
+	 * @return 1 表示这次真的包装了；0 表示跳过（不是表 / 没有 bindClass / 已经包过）
+	 */
+	private static int wrapLuajavaBindClass(LuaValue mod, final ClassLoader loader) {
+		if (mod == null || !mod.istable()) return 0;
+		final LuaTable lj = (LuaTable) mod;
+		final LuaValue origBindClass = lj.get("bindClass");
+		if (origBindClass.isnil() || !origBindClass.isfunction()) return 0;
+		// 三处可能指向同一张表,别套两层
+		if (!lj.get("__android_classloader_wrapped").isnil()) return 0;
+		lj.set("__android_classloader_wrapped", LuaValue.TRUE);
+		lj.set("bindClass", new OneArgFunction() {
+			@Override
+			public LuaValue call(LuaValue className) {
+				final String name = className.tojstring();
+				try {
+					// 不要在这里用反射调 luaj 的 JavaClass.forClass:
+					// 那个类和方法都是包私有的,Class.getMethod() 只搜 public 方法,
+					// 永远抛 NoSuchMethodException。走同包桥接类是编译期直接访问,
+					// 既不需要反射也不需要额外的 keep 规则。
+					return AndroidBindClassBridge.bindClass(name, loader);
+				} catch (Throwable t) {
+					// 走到这里说明连类都加载不到(或 luaj 内部出错),退回 luaj 的原实现。
+					// 这行日志很关键:有它 = 包装生效了但类确实加载不到;没有它 = 包装压根没生效。
+					logWarn("luajava.bindClass fallback for " + name + ": " + t);
+					return origBindClass.call(className);
+				}
+			}
+		});
+		return 1;
+	}
+
+	/**
+	 * 日志走 libGDX 通道。{@code java.util.logging} 在 Android 上不保证进 logcat,
+	 * 而排查这类问题必须看得到输出。
+	 */
+	private static void logInfo(String msg) {
+		if (Gdx.app != null) Gdx.app.log("SkinLua", msg);
+		else Logger.getGlobal().info(msg);
+	}
+
+	private static void logWarn(String msg) {
+		if (Gdx.app != null) Gdx.app.error("SkinLua", msg);
+		else Logger.getGlobal().warning(msg);
 	}
 }

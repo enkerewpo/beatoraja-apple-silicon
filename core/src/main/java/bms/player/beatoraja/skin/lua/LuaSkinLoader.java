@@ -7,7 +7,6 @@ import bms.player.beatoraja.skin.*;
 import bms.player.beatoraja.skin.json.JSONSkinLoader;
 import bms.player.beatoraja.skin.json.JsonSkin;
 import bms.player.beatoraja.skin.property.*;
-import bms.player.beatoraja.select.MusicSelector;
 
 import com.badlogic.gdx.utils.ObjectMap;
 import com.badlogic.gdx.utils.reflect.ClassReflection;
@@ -39,19 +38,15 @@ public class LuaSkinLoader extends JSONSkinLoader {
 	/** 缓存编译后的 Lua 闭包，避免重复读取磁盘和解析 */
 	private LuaValue cachedClosure;
 	private File cachedFile;
-	/** 调用方传入的 MainState，用于判断是否 MusicSelect 走路径重定向 */
-	private final MainState state;
-	/** 是否已为本次加载安装过 io.open 重定向（避免重入） */
+	/** 是否已为本次加载安装过相对路径 IO 重定向（避免重入） */
 	private boolean ioRedirectInstalled = false;
 
 	public LuaSkinLoader() {
 		super(new SkinLuaAccessor(false));
-		this.state = null;
 	}
 
 	public LuaSkinLoader(MainState state, Config c) {
 		super(state, c, new SkinLuaAccessor(false));
-		this.state = state;
 	}
 
 	private LuaValue getExecResult(File p) {
@@ -79,7 +74,7 @@ public class LuaSkinLoader extends JSONSkinLoader {
 		SkinHeader header = null;
 		try {
 			lua.setDirectory(p.getParentFile());
-			installIoRedirectIfMusicSelect(p.getParentFile());
+			installIoRedirect(p.getParentFile());
 			LuaValue value = getExecResult(p);
 			if (value.istable()) {
 				LuaValue h = value.get("header");
@@ -242,15 +237,22 @@ public class LuaSkinLoader extends JSONSkinLoader {
 	}
 
 	/**
-	 * 仅当加载 MusicSelect 皮肤时，把 lua 的 io.open / io.lines 重定向为以皮肤目录为基准。
-	 * 在 Android（user.dir == "/"）下，Lua 皮肤脚本里相对路径（如 "skin/hij_simple/djpoint_log.txt"）
-	 * 无法正确解析。此方法拦截 io.open 和 io.lines，将相对路径先尝试皮肤目录，
-	 * 再尝试 beatoraja.root（Android 外部存储根），最后回退到原始调用。
-	 * 其它状态（PLAY/RESULT 等）走原始 io 函数。
+	 * 把 lua 的 io.open / io.lines / dofile / loadfile 重定向为"相对路径按基准目录解析"。
+	 *
+	 * <p>为什么需要:Android 上进程工作目录是 "/",而皮肤脚本里的相对路径全部是按
+	 * beatoraja 数据根目录写的 —— 也就是桌面端 {@code user.dir} 的语义。例如
+	 * {@code "config_sys.json"}、{@code "player/<name>/config_player.json"}、
+	 * {@code "skin/<folder>/result/courseData.json"}。不重定向时 io.open 一律返回 nil,
+	 * 脚本拿到 nil 后会在后面某一行报 {@code attempt to index ? (a nil value)}
+	 * —— 报错位置离真正的失败点很远,很难查。皮肤作者只能自己用
+	 * {@code skin_config.get_path()} 绕(m_select/load.lua 里的 adv_path 就是这么干的)。</p>
+	 *
+	 * <p>此前这里有一道 {@code state instanceof MusicSelector} 的限制,只有选曲皮肤生效。
+	 * RESULT / PLAY 等状态的皮肤,以及 SkinConfiguration 扫描皮肤时(state == null),
+	 * 都拿不到重定向 —— resultExpand.lua 读 config_sys.json 拿到 nil 即由此而来。</p>
 	 */
-	private void installIoRedirectIfMusicSelect(File skinDir) {
+	private void installIoRedirect(File skinDir) {
 		if (ioRedirectInstalled) return;
-		if (state == null || !(state instanceof MusicSelector)) return;
 		if (skinDir == null) return;
 		LuaTable io;
 		try {
@@ -264,20 +266,35 @@ public class LuaSkinLoader extends JSONSkinLoader {
 		final String androidRoot = System.getProperty("beatoraja.root");
 		final File skinDirFinal = skinDir;
 
-		// Helper: resolve a relative path against multiple base directories
+		// 解析相对路径。顺序即优先级,四步各自解决一类真实场景:
+		//   1. 脚本同目录 —— 与脚本放一起的辅助文件
+		//   2. beatoraja 数据根目录 —— 皮肤约定("config_sys.json" / "player/..." / "skin/...")
+		//   3. 进程工作目录 —— 桌面端 user.dir 就是数据根目录,必须保留,否则桌面端反而坏掉
+		//   4. 目标还不存在(写场景)—— 按第一级目录名字判断该落在根目录还是脚本目录
 		java.util.function.Function<String, String> resolvePath = path -> {
 			if (path == null || path.isEmpty()) return path;
-			File f = new File(path);
-			if (f.isAbsolute()) return path;
-			// Try skin directory first
-			f = new File(skinDirFinal, path);
+			if (new File(path).isAbsolute()) return path;
+
+			File f = new File(skinDirFinal, path);
 			if (f.exists()) return f.getAbsolutePath();
-			// Try beatoraja.root (covers "skin/xxx/yyy.txt" style paths)
-			if (androidRoot != null && !androidRoot.isEmpty()) {
+
+			final boolean hasRoot = androidRoot != null && !androidRoot.isEmpty();
+			if (hasRoot) {
 				File f2 = new File(androidRoot, path);
 				if (f2.exists()) return f2.getAbsolutePath();
 			}
-			// Fallback: resolve relative to skinDir even if file doesn't exist yet (for writes)
+
+			if (new File(path).exists()) return path;
+
+			if (hasRoot) {
+				int slash = path.indexOf('/');
+				// 只在 "skin/xxx"、"player/xxx" 这类"第一级是数据根下的真实目录"时才判给根目录,
+				// 否则 "result/foo.json" 这种同目录子路径会被误判
+				if (slash > 0 && new File(androidRoot, path.substring(0, slash)).isDirectory()) {
+					return new File(androidRoot, path).getAbsolutePath();
+				}
+			}
+			// 写入兜底:落在脚本目录旁边
 			return new File(skinDirFinal, path).getAbsolutePath();
 		};
 
@@ -308,6 +325,34 @@ public class LuaSkinLoader extends JSONSkinLoader {
 				return originalLines.invoke(args);
 			}
 		});
+
+		// dofile / loadfile 走的是 BaseLib,不经过 io.open,同样按 CWD 解析,必须单独包装。
+		// 皮肤里确有使用:m_select 的 dofile(adv_path(...))、GenericTheme 的 dofile(path..".lua")、
+		// m_select/result/resultmain.lua 的 loadfile(path)。
+		wrapFileLoader("dofile", resolvePath);
+		wrapFileLoader("loadfile", resolvePath);
+
 		ioRedirectInstalled = true;
+	}
+
+	/** 把全局的 dofile / loadfile 包装成"相对路径先按基准目录解析"。绝对路径原样透传。 */
+	private void wrapFileLoader(String name, java.util.function.Function<String, String> resolvePath) {
+		final LuaValue original = lua.getGlobals().get(name);
+		if (original.isnil() || !original.isfunction()) return;
+		lua.getGlobals().set(name, new VarArgFunction() {
+			@Override
+			public Varargs invoke(Varargs args) {
+				// 无参调用(读 stdin)保持原行为
+				if (args.narg() < 1 || args.arg1().isnil()) {
+					return original.invoke(args);
+				}
+				LuaValue[] newArgs = new LuaValue[args.narg()];
+				newArgs[0] = LuaValue.valueOf(resolvePath.apply(args.arg1().tojstring()));
+				for (int i = 1; i < args.narg(); i++) {
+					newArgs[i] = args.arg(i + 1);
+				}
+				return original.invoke(LuaValue.varargsOf(newArgs));
+			}
+		});
 	}
 }

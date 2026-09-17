@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 
 import bms.model.BMSModel;
 import bms.model.Note;
@@ -33,6 +34,7 @@ import bms.player.beatoraja.select.bar.SongBar;
 import bms.player.beatoraja.song.SongData;
 import com.starxh.beatoraja.AudioSpectrumManager;
 import com.starxh.beatoraja.AudioSpectrumProvider;
+import com.starxh.beatoraja.PlaybackCpuLockManager;
 
 /**
  * 选曲界面中的 Music Player 状态 —— 跑当前选中歌曲的 BMS autoplay,只播放 BG 音轨,
@@ -62,7 +64,16 @@ public class MusicPlayer extends MainState {
 	private volatile Texture stagefile;
 	// dispose 之后 transition 不要再起新线程 —— 防止 dispose 和 transition 竞争导致孤儿线程
 	private volatile boolean disposed = false;
-	private Pixmap stagefilePixmap;
+
+	/**
+	 * Activity 进入后台(锁屏 / 切走)时为 true。
+	 *
+	 * <p>此时屏幕什么都看不见,但绘制、字形布局、封面解码照样吃 CPU 并制造垃圾,
+	 * 而一次 stop-the-world GC 会把 BGAutoplayThread 一起暂停 —— 音符整批迟到。
+	 * 锁屏期间 MusicPlayer 只需要干一件事:把音符按时送进 AudioDriver。
+	 * 所以这里把所有 GL 相关工作和封面解码全部关掉,只留播放。</p>
+	 */
+	private volatile boolean backgrounded = false;
 	/**
 	 * 串行执行所有"重活"的单线程 executor:加载 BMSModel、换 AudioDriver 音频模型、启停播放线程。
 	 *
@@ -72,7 +83,27 @@ public class MusicPlayer extends MainState {
 	 * 重则 native use-after-free 直接崩进程。这里把所有结构性操作收敛到单线程,
 	 * 并在切换前后与播放线程做交接(先停播放线程,再换模型),彻底消除该竞态。
 	 */
-	private ExecutorService worker;
+	/** worker 由 loader 线程(startAdvanceWatcher)创建、GL 线程(scheduleStagefileDecode)读取 */
+	private volatile ExecutorService worker;
+
+	/**
+	 * 专职加载线程 —— 和 worker 分开,因为两者会互相拖累。
+	 *
+	 * <p>worker 上跑的是"曲尾自动切歌"的监视循环,轻量但必须及时;加载是重活
+	 * (解析 BMS + 解码几百个音源 + 扫 tail 时读几千个音频头 + 写 SQLite),
+	 * 一次可能几秒。挤在同一条线程上,监视循环会被加载堵住导致曲尾接不上,
+	 * 加载反过来也会被 200ms 一次的检查搅碎。</p>
+	 */
+	private volatile ExecutorService loader;
+	/** 加载请求序号。只有序号等于当前值的 job 才真正执行,被后来者取代的直接空转返回。 */
+	private final AtomicLong loadSeq = new AtomicLong();
+	/** 与 loadSeq 配套的互斥锁:保证同一时刻只有一个加载 / 切歌在进行。 */
+	private final Object loadLock = new Object();
+	/** 是否正在加载。 */
+	private volatile boolean loading = false;
+	/** 自动切歌监视任务是否已在 worker 上跑起来 —— 每首歌 submit 一次会累加出多个循环。 */
+	private volatile boolean advanceWatcherStarted = false;
+
 	/**
 	 * 1x1 纯白纹理 —— 所有纯色矩形都靠它 + batch.setColor() 染出来。
 	 *
@@ -122,9 +153,100 @@ public class MusicPlayer extends MainState {
 	// 后台切换歌曲时的并发守卫,防止 AutoAdvanceThread 重复进入
 	private volatile boolean isTransitioning = false;
 
-	// 后台过渡时旧 stagefile 无法立即 dispose(需要 GL 线程),先暂存,等 render() 再清理
-	// 跨线程:transitionToNextInBackground (后台) 写,render (GL) 读+dispose —— volatile
-	private volatile Texture stagefileToDispose = null;
+	/**
+	 * 等待 GL 线程释放的旧纹理。
+	 *
+	 * <p>Texture 只能在 GL 线程 dispose,而"该换封面了"这件事发生在 loader/worker 线程。
+	 * 之前这里是一个 {@code volatile Texture stagefileToDispose} 单槽位,有两个问题:
+	 * 一是只能挂一张,连着切两首时前一张会被覆盖掉,直接泄漏;二是<b>只有自动切歌
+	 * 那条路径会往里放</b>,手动 PREV/NEXT 走的 loadSingle() 反而把旧封面原样留在
+	 * {@code stagefile} 上 —— 于是新歌的封面解出来之前,屏幕上一直挂着上一首的图,
+	 * 新歌要是压根没有封面,那张图就永远留在那儿了。</p>
+	 *
+	 * <p>改成无锁队列 + 统一的 {@link #retireStagefile()} 之后,任何切歌路径都只是
+	 * 把当前封面摘下来投递,GL 线程每帧 drain 一次,既不丢也不滞留。</p>
+	 */
+	private final java.util.concurrent.ConcurrentLinkedQueue<Texture> glTextureGarbage =
+			new java.util.concurrent.ConcurrentLinkedQueue<>();
+
+	/**
+	 * 保护 {@link #stagefile} 的"摘除"与"替换"这两个动作。
+	 *
+	 * <p>这两件事来自不同线程,而且会真正并发:切歌时 loader 线程摘封面,
+	 * GL 线程同时可能正在把刚解码完的 pixmap 换成 Texture。不加保护的话会出现
+	 * "同一个 Texture 被两边各释放一次"——第二次删的是一个已经无效、
+	 * 甚至可能已被 GL 复用给别的纹理的 ID,轻则画面错乱重则崩。
+	 * 加锁后两个动作各自是原子的,谁先谁后都不会重放同一张。</p>
+	 */
+	private final Object stagefileLock = new Object();
+
+	/**
+	 * 把当前封面从 {@link #stagefile} 摘下来、投递给 GL 线程回收。任意线程可调。
+	 *
+	 * <p>摘除是同步的:调用方一返回,{@code stagefile} 就一定是 null 了,
+	 * 不会出现"切歌了但屏幕还在画旧封面"的中间态。</p>
+	 */
+	private void retireStagefile() {
+		Texture old;
+		synchronized (stagefileLock) {
+			old = stagefile;
+			stagefile = null;
+		}
+		if (old != null) {
+			glTextureGarbage.add(old);
+		}
+	}
+
+	/** GL 线程上释放所有已投递的旧纹理。每帧调一次。 */
+	private void drainRetiredTextures() {
+		Texture t;
+		while ((t = glTextureGarbage.poll()) != null) {
+			t.dispose();
+		}
+	}
+
+	/**
+	 * 后台线程已解码、等 GL 线程上传成纹理的舞台图。
+	 *
+	 * <p>为什么要有这一层:解码一张封面(读文件 + 解压)是纯 CPU 活,但以前它被放在
+	 * {@code render()} 里同步做 —— 切歌后 stagefile 被置 null,下一帧就在主线上解码。
+	 * 一张几百 KB 的 PNG 展开成 Pixmap 常常要上百毫秒,期间主线程卡住(Choreographer
+	 * "Skipped N frames"),更糟的是随之而来的大 GC 是 stop-the-world,会把
+	 * BGAutoplayThread 一起暂停 —— 音符整批迟到,日志上就是
+	 * "BGAutoplay starved for Nms"。主线程掉帧和音符 starve 两个数字几乎相等,
+	 * 就是这个原因。</p>
+	 *
+	 * <p>现在解码挪到 worker 线程,render() 只做{@code new Texture()}上传。</p>
+	 */
+	private volatile Pixmap pendingStagefilePixmap = null;
+
+	/**
+	 * {@link #pendingStagefilePixmap} 里那张封面属于哪首曲子(记 {@code currentSong.getPath()})。
+	 *
+	 * <p>为什么必须记:解码是异步的,而"解码"和"上传"发生在两个不同的时刻。快速连续切歌时,
+	 * 歌曲 A 的封面可能在这时刚解完,而 {@code currentSong} 已经变成 B 了。上传端如果只看
+	 * "有没有 pixmap",就会把 A 的封面当成 B 的画上去 —— 封面张冠李戴,而且要等下一次
+	 * 切歌才纠正。更坏的情况是新歌根本没有封面,{@code decodeStagefile()} 直接 return,
+	 * 那张 {@code pendingStagefilePixmap} 会永远留着,于是一路错下去。</p>
+	 *
+	 * <p>上传前后各校验一次:解码端解完发现已切歌就丢弃结果,上传端发现 key 与
+	 * {@code currentSong} 不符就丢弃并清掉 {@link #stagefileDecodeKey},让下一帧重新请求。</p>
+	 */
+	private volatile String pendingStagefileKey = null;
+
+	/** 舞台图上传前的最大边长。显示区只有 480x320,没必要把 2000px 的原图传进显存。 */
+	private static final int MAX_STAGEFILE_PX = 640;
+
+	/**
+	 * 已经为哪首曲子请求过封面解码。
+	 *
+	 * 没有封面的曲子,decodeStagefile() 会直接返回,stagefile 就永远是 null。
+	 * 如果 render() 用 "stagefile == null 就重试" 来兜底,那首曲子会变成
+	 * 每帧一次 findImagePath()(要对目录做列举 + 大小写不敏感匹配),
+	 * 60fps 下就是每秒 60 次文件系统操作 —— 白烧 CPU 还制造垃圾。
+	 * 所以每首只请求一次,失败就认了。
+	 */
+	private volatile String stagefileDecodeKey = null;
 
 	// 播放模式 (顺序 / 随机 / 单曲循环)
 	private enum PlayMode { SEQUENCE, RANDOM, LOOP_ONE }
@@ -162,43 +284,20 @@ public class MusicPlayer extends MainState {
 		// disposed 守卫拦下 —— 表现为"能播当前曲但永远不自动切歌"。
 		this.disposed = false;
 		this.isTransitioning = false;
+		// 状态实例可能被复用;不复位的话上次锁屏留下的标志会让进来就黑屏。
+		this.backgrounded = false;
 
-		// 获取所有歌曲（不再依赖 MusicSelector 的 BarManager）
-		this.allSongs = main.getSongDatabase().getSongDatas();
-		if (allSongs == null || allSongs.length == 0) {
-			main.changeState(MainStateType.MUSICSELECT);
-			return;
-		}
-
-		// 如果 MusicSelector 当前选中的是 SongBar，保持同步
-		BarManager selectorBarManager = main.getMusicSelector().getBarManager();
-		Bar selectorBar = selectorBarManager.getSelected();
-		if (selectorBar instanceof SongBar) {
-			SongData selectorSong = ((SongBar) selectorBar).getSongData();
-			for (int i = 0; i < allSongs.length; i++) {
-				if (allSongs[i].getSha256().equals(selectorSong.getSha256())) {
-					selectedIndex = i;
-					break;
-				}
-			}
-		}
-
-		this.currentSong = allSongs[selectedIndex];
-		this.currentModel = resource.loadBMSModel(
-				Gdx.files.absolute(currentSong.getPath()),
-				resource.getPlayerConfig().getLnmode());
-		if (this.currentModel == null) {
-			main.changeState(MainStateType.MUSICSELECT);
-			return;
-		}
-		// 把模型的 WAV 列表灌进 AudioDriver,否则 audio.play(note) 会数组越界
-		main.getAudioProcessor().setModel(currentModel);
-
-		// 资源状态对齐 autoplay
-		resource.setPlayMode(BMSPlayerMode.AUTOPLAY);
-
-		// 舞台图
-		loadStagefile();
+	// !!! 从这里往下的重活全部搬到 loader 线程,千万别搬回来 !!!
+	//
+	// 原因:下面这一段单首可能耗时几百毫秒~数秒 —— 读全曲库、解析 BMS、
+	// 对几百个音源文件做解码(setModel)、扫 tail 时读几千个音频头、写 SQLite。
+	// 这些放在 GL 线程上会直接卡住 Choreographer(logcat 里就是
+	// "Skipped 211 frames!")。此前它们藏在 create() 和 loadAndPlaySelected() 里,
+	// 而这两个方法都在 GL 线程上被调用,所以每次进 MusicPlayer、每次手动
+	// PREV/NEXT 都会卡这么一下。
+	//
+	// 写下来的原因:之前两轮修复都只处理了"解码要挪走"这一件事,没处理
+	// "谁来付这笔钱" —— 结果 BMS 解析和 setModel 仍留在主线程,卡顿一点没少。
 
 		// 字体
 		this.font = main.getSystemFont18();
@@ -207,26 +306,6 @@ public class MusicPlayer extends MainState {
 			this.fontOwned = true;
 		}
 		this.font.setColor(Color.WHITE);
-
-		// 总时长:对齐 BMSPlayer 公式 Math.max(lastEventTime + 1000, lastNoteTime + tail)
-		final int lastEventTime = currentModel.getLastTime();
-		final int lastNoteTime = currentModel.getLastNoteTime();
-		int tail = currentSong.getTail();
-		if (tail <= 0) {
-			// 数据库无记录或为0，执行扫描逻辑以修复
-			tail = calculateMaxTailMs(currentModel, lastNoteTime);
-			currentSong.setTail(tail);
-			main.getSongDatabase().updateSongTail(currentModel.getSHA256(), tail);
-		}
-		this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + tail);
-		Gdx.app.log("MusicPlayer", "Loaded totalDurationMs: " + totalDurationMs + " ms, tail: " + tail + ", lastNoteTime: " + lastNoteTime + ", lastEventTime: " + lastEventTime);
-
-		// 启动 BG 自动播放线程(单调时钟,不受系统改表 / NTP 校时影响)
-		this.playBaseNanos = System.nanoTime();
-		startBgThread(currentModel);
-
-		// 自动切歌:常驻监视任务跑在 worker 单线程上,不再每首歌 new 一个 Thread
-		startAdvanceWatcher();
 
 		// 启动 ShapeRenderer
 		if (this.shapeRenderer == null) {
@@ -241,21 +320,361 @@ public class MusicPlayer extends MainState {
 
 		// 启动后开启持续渲染(选曲界面默认是关的)
 		Gdx.graphics.setContinuousRendering(true);
+
+		// 锁屏后保持 CPU 运行。没有它,屏幕一灭系统就把 CPU 拉进低功耗并把普通线程的
+		// 定时器 slack 放大,BGAutoplayThread 的唤醒精度会崩 —— 音符晚点(不同步)或
+		// 被 Starve 保护整批丢弃(停顿)。libGDX 自带的 useWakelock 是 FULL_WAKE_LOCK
+		// 且在 Activity.onPause() 就被 release,帮不上忙。
+		PlaybackCpuLockManager.acquire(this, "MusicPlayer");
+
+		// 真正把这首曲子跑起来:在 loader 线程上完成全部重活,期间 render() 画载入画面。
+		requestLoad(selectedIndex, true);
 	}
 
-	private void loadStagefile() {
-		String path = currentSong.getStagefile();
+	// ------------------------------------------------------------------
+	// 加载流水线 —— 所有重活都在这个方法里,且只跑在 loader 单线程上
+	// ------------------------------------------------------------------
+
+	/** 取得(必要时创建)loader。所有结构化操作串行在这一个线程上。 */
+	private ExecutorService ensureLoader() {
+		ExecutorService ld = loader;
+		if (ld == null || ld.isShutdown()) {
+			ld = Executors.newSingleThreadExecutor(r -> {
+				Thread t = new Thread(r, "MusicPlayer-Loader");
+				t.setDaemon(true);
+				try {
+					t.setPriority(Thread.NORM_PRIORITY + 2);
+				} catch (Throwable ignored) {
+				}
+				return t;
+			});
+			loader = ld;
+		}
+		return ld;
+	}
+
+	/**
+	 * 提交一次加载请求。同一时刻只允许最后一次请求生效 —— 连续点 PREV/NEXT 时,
+	 * 中间那些已经被取代的 job 会在 performLoad() 开头直接返回,不做无谓解码。
+	 */
+	private void requestLoad(int index, boolean initial) {
+		final long mySeq = loadSeq.incrementAndGet();
+		loading = true;
+		// 加载期间挡住自动切歌监视任务:此刻 playBaseNanos / totalDurationMs 还是
+		// 上一首的,不挡的话它会每 200ms 重复触发一次切歌。
+		isTransitioning = true;
+		// 立刻退出"正在播放"的显示态。进度条的时间源就是 playBaseNanos,不清零的话
+		// 加载期间它会继续拿上一首的基准往前走 —— 而列表高亮和歌名在 loadSingle()
+		// 一开头就换成新歌了,于是画面变成"新歌 + 上一首还在涨的进度条"。
+		// 清零之后进度条归零、时间显示 0:00 / 0:00,再由 render() 补一个 Loading 提示。
+		playBaseNanos = 0;
+		totalDurationMs = 0;
+		final ExecutorService ld = ensureLoader();
+		try {
+			ld.submit(() -> performLoad(index, initial, mySeq));
+		} catch (Throwable t) {
+			loading = false;
+			isTransitioning = false;
+		}
+	}
+
+	/**
+	 * 完整的单曲加载:停旧的 → 解析 BMS → 换音频模型 → 算时长 → 解封面 → 起播放线程。
+	 *
+	 * <p>只跑在 loader 单线程上,并用 {@link #loadLock} 与自动切歌互斥。
+	 * 两者都会调用 {@code setModel()},并发执行的话,一个线程刚把 wavmap 换成新模型的、
+	 * 另一个可能正拿着旧引用在播 —— 而 setModel() 会 disposeOld() 释放旧 PCM
+	 * (Oboe 是 native 对象),那就是 use-after-free。必须串行。</p>
+	 */
+	private void performLoad(int index, boolean initial, long mySeq) {
+		try {
+			if (disposed || mySeq != loadSeq.get()) return;
+			synchronized (loadLock) {
+				if (disposed || mySeq != loadSeq.get()) return;
+				loadSingle(index, initial);
+			}
+		} catch (Throwable t) {
+			if (Gdx.app != null) {
+				Gdx.app.error("MusicPlayer", "load failed", t);
+			}
+		} finally {
+			loading = false;
+			// 被后来者取代的 job 不要清标志 —— 赢的那个会清。
+			if (mySeq == loadSeq.get()) {
+				isTransitioning = false;
+			}
+		}
+	}
+
+	/**
+	 * 让自动切歌监视任务闭嘴。
+	 *
+	 * 监视任务的判据是 {@code total > 0},所以置 0 就够 —— 不必用 Long.MAX_VALUE:
+	 * 那样进度条的时间文字会拿 formatTime(Long.MAX_VALUE) 去格式化,显示成一串天文数字。
+	 * 加载失败、时长还没定出来时都走这里。
+	 */
+	private void silenceAdvanceWatcher() {
+		totalDurationMs = 0;
+	}
+
+	private void loadSingle(int index, boolean initial) {
+		final long startNanos = System.nanoTime();
+
+		if (initial) {
+			// 获取所有歌曲（不再依赖 MusicSelector 的 BarManager）
+			this.allSongs = main.getSongDatabase().getSongDatas();
+			if (allSongs == null || allSongs.length == 0) {
+				silenceAdvanceWatcher();
+				Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
+				return;
+			}
+			// 如果 MusicSelector 当前选中的是 SongBar，保持同步
+			Bar selectorBar = main.getMusicSelector().getBarManager().getSelected();
+			if (selectorBar instanceof SongBar) {
+				SongData selectorSong = ((SongBar) selectorBar).getSongData();
+				for (int i = 0; i < allSongs.length; i++) {
+					if (allSongs[i].getSha256().equals(selectorSong.getSha256())) {
+						index = i;
+						break;
+					}
+				}
+			}
+			selectedIndex = index;
+		}
+
+		if (allSongs == null || index < 0 || index >= allSongs.length) return;
+		SongData next = allSongs[index];
+		if (next == null) return;
+		selectedIndex = index;
+		this.currentSong = next;
+		// 换歌了,旧封面必须立刻下屏:光把 currentSong 换掉是不够的,
+		// stagefile 还指着上一首那张图,而 Texture 只能交给 GL 线程回收。
+		retireStagefile();
+
+		// 先解析谱面,再停旧歌。loadBMSModel() 只读文件、完全不碰音频驱动,
+		// 所以旧歌可以一直播到这一步 —— 放到 stopBgThread() 后面的话,这几百毫秒
+		// 就是纯静音,听感上就是"切歌时莫名其妙断一下"。
+		this.currentModel = resource.loadBMSModel(
+				Gdx.files.absolute(next.getPath()),
+				resource.getPlayerConfig().getLnmode());
+		if (this.currentModel == null) {
+			silenceAdvanceWatcher();
+			Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
+			return;
+		}
+		if (disposed) return;
+
+		// 到这里必须停:setModel() 会整体替换 wavmap 并 disposeOld() 释放旧 PCM
+		// (Oboe 是 native 对象),播放线程还活着的话就是 use-after-free。
+		stopBgThread();
+		stopAllNotes();
+
+		// 把模型的 WAV 列表灌进 AudioDriver,否则 audio.play(note) 会数组越界
+		main.getAudioProcessor().setModel(currentModel);
+		resource.setPlayMode(BMSPlayerMode.AUTOPLAY);
+
+		// 上面 stopBgThread() 掐掉了音符调度,下面 startBgThread() 才重新开始 ——
+		// 这中间就是用户听到的"切歌空白"。所以窗口里每多一件活,空白就长一截。
+		// tail 计算(要读几千个音频头 + 写一次 SQLite)和封面解码都不影响发声,
+		// 全部挪到 startBgThread() 之后去做。
+		final int lastEventTime = currentModel.getLastTime();
+		final int lastNoteTime = currentModel.getLastNoteTime();
+		int tail = currentSong.getTail();
+
+		// 起播放线程。要在 setModel() 之后 —— 播放线程读的 wavmap 必须是新模型灌好的那份。
+		this.playBaseNanos = System.nanoTime();
+		startBgThread(currentModel);
+
+		// 立刻给一个时长,让进度条从 0 开始正常走。tail 的精确值要读几千个音频头才算得出来,
+		// 不能为了等它让进度条停在 0 —— 那看起来像卡住了。这个值偏小无害:它只表示
+		// "至少有这么久",精确值算完会在方法末尾覆盖它。
+		// 注意:这里把 totalDurationMs 从 0 变成非 0,理论上就给了监视任务触发条件,
+		// 但 requestLoad() 设的 isTransitioning 要到 performLoad() 的 finally 才清,
+		// 覆盖了整个 loadSingle(),所以监视任务碰不到这里。
+		this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + Math.max(tail, 0));
+
+		// ---- 以下都是不发声的收尾,不再占用静音窗口 ----
+
+		// 封面:趁还在 loader 线程上解码,别留给 render() 在 GL 线程解
+		stagefileDecodeKey = currentSong.getPath();
+		decodeStagefile();
+
+		if (tail <= 0) {
+			try {
+				tail = calculateMaxTailMs(currentModel, lastNoteTime);
+				currentSong.setTail(tail);
+				main.getSongDatabase().updateSongTail(currentModel.getSHA256(), tail);
+			} catch (Throwable e) {
+				// 算不出来就退化成 tail = 0,下面的公式会给出 lastEventTime + 1000。
+				// 重点是这条路径也必须走到下面那次赋值 —— 不能让 totalDurationMs 停在
+				// 上面那个估算值上,否则曲尾判定会偏早,整首歌没播完就被切走。
+				if (Gdx.app != null) Gdx.app.error("MusicPlayer", "calculateMaxTailMs failed", e);
+				tail = 0;
+			}
+		}
+		this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + Math.max(tail, 0));
+
+		if (Gdx.app != null) {
+			Gdx.app.log("MusicPlayer", "loaded \"" + currentSong.getTitle() + "\" in "
+					+ ((System.nanoTime() - startNanos) / 1000000L) + "ms, totalDurationMs=" + totalDurationMs
+					+ ", tail=" + tail + ", lastNoteTime=" + lastNoteTime + ", lastEventTime=" + lastEventTime);
+		}
+
+		startAdvanceWatcher();
+	}
+
+	/**
+	 * 解码舞台图 —— 读文件 + 解压,纯 CPU,不碰 GL,可在任意线程调用。
+	 * 结果放进 {@link #pendingStagefilePixmap},由 GL 线程的
+	 * {@link #applyPendingStagefile()} 上传。
+	 */
+	private void decodeStagefile() {
+		// 后台不解码:屏幕看不见,解码出来的垃圾还会招来 stop-the-world GC。
+		// 回到前台后由 resume() 重新调度。
+		if (backgrounded) return;
+		// 整段用同一个快照。currentSong 是 volatile,切歌线程随时会换掉它;
+		// 逐次去读可能拼出"用 A 的目录 + B 的封面名"这种半新半旧的组合。
+		final SongData song = currentSong;
+		if (song == null) return;
+		final String ownerPath = song.getPath();
+		if (ownerPath == null) return;
+		String path = song.getStagefile();
 		if (path == null || path.isEmpty()) {
-			path = currentSong.getBanner();
+			path = song.getBanner();
 		}
 		if (path == null || path.isEmpty()) return;
-		File bmsFile = new File(currentSong.getPath());
+		File bmsFile = new File(ownerPath);
 		File coverFile = new File(bmsFile.getParentFile(), path);
 		String resolved = PixmapResourcePool.findImagePath(coverFile.getAbsolutePath());
 		if (resolved == null) return;
-		this.stagefilePixmap = PixmapResourcePool.loadPicture(resolved);
-		if (this.stagefilePixmap != null) {
-			this.stagefile = new Texture(stagefilePixmap);
+		Pixmap pm = PixmapResourcePool.loadPicture(resolved);
+		if (pm == null) return;
+		Pixmap scaled = downscaleIfNeeded(pm);
+
+		// 解码是几百毫秒的活,期间很可能又切歌了(连续按 NEXT 尤其明显)。
+		// 这份结果已经属于上一首,再上传上去就是封面张冠李戴 —— 就地丢弃。
+		// 不做这个检查的话,丢掉的还只是这一张;真正致命的是下面的
+		// "新歌没封面 → 这张永久残留"路径,见 pendingStagefileKey 的注释。
+		if (disposed || !isStillCurrent(ownerPath)) {
+			scaled.dispose();
+			return;
+		}
+		// 上一张还没来得及上传就被下一首顶掉了 —— 直接丢,别让它占着 native 内存
+		Pixmap stale = pendingStagefilePixmap;
+		pendingStagefilePixmap = scaled;
+		pendingStagefileKey = ownerPath;
+		if (stale != null && stale != scaled) {
+			stale.dispose();
+		}
+	}
+
+	/** 这份封面记录是否仍对应 {@link #currentSong}。跨线程读 volatile,只做一次快照比较。 */
+	private boolean isStillCurrent(String songPath) {
+		SongData song = currentSong;
+		if (song == null) return false;
+		String now = song.getPath();
+		return now != null && now.equals(songPath);
+	}
+
+	/** 边长超过 {@link #MAX_STAGEFILE_PX} 就等比缩小;不需要缩放时原样返回。 */
+	private static Pixmap downscaleIfNeeded(Pixmap src) {
+		int w = src.getWidth();
+		int h = src.getHeight();
+		if (w <= MAX_STAGEFILE_PX && h <= MAX_STAGEFILE_PX) return src;
+		float scale = Math.min((float) MAX_STAGEFILE_PX / w, (float) MAX_STAGEFILE_PX / h);
+		int nw = Math.max(1, (int) (w * scale));
+		int nh = Math.max(1, (int) (h * scale));
+		Pixmap dst = null;
+		try {
+			dst = new Pixmap(nw, nh, src.getFormat());
+			dst.setFilter(Pixmap.Filter.BiLinear);
+			dst.drawPixmap(src, 0, 0, w, h, 0, 0, nw, nh);
+		} catch (Throwable t) {
+			if (dst != null) dst.dispose();
+			return src; // 缩放失败就用原图,总比什么都不显示强
+		}
+		src.dispose();
+		return dst;
+	}
+
+	/**
+	 * 把 {@link #pendingStagefilePixmap} 上传成纹理。只能在 GL 线程调用。
+	 * 这是 render() 里唯一剩下的舞台图工作,耗时从"解码整张图"降到"一次纹理上传"。
+	 */
+	private void applyPendingStagefile() {
+		Pixmap pm = pendingStagefilePixmap;
+		if (pm == null) return;
+		final String key = pendingStagefileKey;
+		pendingStagefilePixmap = null;
+		pendingStagefileKey = null;
+
+		// 归属校验:解码完成和这里上传之间隔了至少一帧,期间完全可能又切过歌。
+		// 不匹配就地丢弃。同时必须把 stagefileDecodeKey 一起清掉 —— 不然
+		// ensureStagefileRequested() 会认为"当前这首已经请求过了",永远不再请求,
+		// 那一首从此再也没有封面(正是"显示不正确"里最难复原的那种)。
+		if (key == null || !isStillCurrent(key)) {
+			pm.dispose();
+			stagefileDecodeKey = null;
+			return;
+		}
+
+		Texture fresh = null;
+		try {
+			// 上传本身放在锁外:它可能耗时(几十毫秒),没必要把 retireStagefile() 挡在门外。
+			fresh = new Texture(pm);
+		} catch (Throwable t) {
+			if (Gdx.app != null) Gdx.app.error("MusicPlayer", "Failed to upload stagefile", t);
+		} finally {
+			// 像素已经进显存,Pixmap 的 native 内存可以放了。
+			// 老实现从未 dispose 它,切几次歌就攒下好几张原图的 native 内存。
+			pm.dispose();
+		}
+		if (fresh == null) return;
+
+		Texture old;
+		synchronized (stagefileLock) {
+			old = stagefile;
+			stagefile = fresh;
+		}
+		// 旧的一律走同一个回收队列 —— 保证一张纹理只有一个释放点。
+		// 直接在这里 dispose 的话,和 retireStagefile() 并发时会重复释放同一张
+		// (第二次删的可能是已被 GL 复用给别的纹理的 ID)。队列延迟一帧释放,无所谓。
+		if (old != null && old != fresh) {
+			glTextureGarbage.add(old);
+		}
+	}
+
+	/**
+	 * 当前曲子还没请求过封面解码的话就请求一次。
+	 *
+	 * 绝不能在 GL 线程上同步解码 —— 见 {@link #stagefileDecodeKey} 的注释说明
+	 * 为什么要按曲目去重。
+	 */
+	private void ensureStagefileRequested() {
+		if (currentSong == null) return;
+		String key = currentSong.getPath();
+		if (key == null) return;
+		if (key.equals(stagefileDecodeKey)) return;
+		// 已经有结果(或已在解码队列里)了,别重复调度
+		if (stagefile != null || pendingStagefilePixmap != null) {
+			stagefileDecodeKey = key;
+			return;
+		}
+		stagefileDecodeKey = key;
+		scheduleStagefileDecode();
+	}
+
+	/** 把封面解码丢给 worker,GL 线程不碰解码这件事。 */
+	private void scheduleStagefileDecode() {
+		ExecutorService w = ensureWorker();
+		if (w == null || w.isShutdown()) return;
+		try {
+			w.submit(() -> {
+				if (disposed) return;
+				decodeStagefile();
+			});
+		} catch (Throwable ignored) {
+			// executor 已关(正在退出),不解码就是了
 		}
 	}
 
@@ -314,15 +733,36 @@ public class MusicPlayer extends MainState {
 	 *    旧实现还经常漏掉 stop 旧线程;
 	 *  - 常驻任务只有一个线程,和手动切歌共用 {@code synchronized(this)},天然串行。
 	 */
-	private void startAdvanceWatcher() {
-		if (worker == null || worker.isShutdown()) {
-			worker = Executors.newSingleThreadExecutor(r -> {
+	/** 取得(必要时创建)worker。自动切歌监视和封面解码都跑在这一个线程上。 */
+	private ExecutorService ensureWorker() {
+		ExecutorService w = worker;
+		if (w == null || w.isShutdown()) {
+			w = Executors.newSingleThreadExecutor(r -> {
 				Thread t = new Thread(r, "MusicPlayer-Worker");
 				t.setDaemon(true);
+				// 略高于默认:它负责切歌时的 BMSModel 加载和 setModel(CPU 密集),
+				// 锁屏后如果被饿到,曲尾会明显空一拍才接上下一首。
+				// 不给 MAX —— 解码是重活,抢太狠反而拖慢音符调度线程。
+				try {
+					t.setPriority(Thread.NORM_PRIORITY + 2);
+				} catch (Throwable ignored) {
+				}
 				return t;
 			});
+			worker = w;
 		}
-		worker.submit(() -> {
+		return w;
+	}
+
+	private void startAdvanceWatcher() {
+		if (disposed) return;
+		// 每首歌都 submit 会累加出多个监视循环 —— 它们会各自触发切歌,
+		// 表现就是曲尾连续跳好几首。整个实例只要起一次。
+		if (advanceWatcherStarted) return;
+		ExecutorService w = ensureWorker();
+		if (w.isShutdown()) return;
+		advanceWatcherStarted = true;
+		w.submit(() -> {
 			while (!disposed && !Thread.currentThread().isInterrupted()) {
 				try {
 					long total = totalDurationMs;
@@ -367,32 +807,57 @@ public class MusicPlayer extends MainState {
 	 * 释放本类持有的 GL 资源。在 resume() 里也要调一次 —— 切后台时 GL 上下文会被销毁
 	 * 重建,旧 Texture 句柄全部失效,必须丢掉重来。
 	 */
-	private void disposeGlResources() {
+	/**
+	 * 释放本类持有的 GL 资源。
+	 *
+	 * @param contextAlive true = GL 上下文仍然有效,可以真正 dispose(暂停、退出时);
+	 *                     false = 上下文已经重建过,旧句柄全是野指针 —— 只能丢弃引用,
+	 *                     拿去 dispose 反而可能误伤新上下文里被复用的纹理 ID
+	 */
+	private void disposeGlResources(boolean contextAlive) {
 		if (whiteTexture != null) {
-			whiteTexture.dispose();
+			if (contextAlive) whiteTexture.dispose();
 			whiteTexture = null;
 		}
 		if (stagefile != null) {
-			stagefile.dispose();
+			if (contextAlive) stagefile.dispose();
 			stagefile = null;
 		}
-		stagefileToDispose = null;
+		// 队列里排着的旧纹理。上下文还在就真释放;已经重建过的话句柄是野指针,
+		// 只丢引用(此时那批纹理早随旧上下文一起没了)。
+		Texture retired;
+		while ((retired = glTextureGarbage.poll()) != null) {
+			if (contextAlive) retired.dispose();
+		}
+		// Pixmap 是纯 CPU 内存,与 GL 上下文无关,什么时候都能放
+		if (pendingStagefilePixmap != null) {
+			pendingStagefilePixmap.dispose();
+			pendingStagefilePixmap = null;
+		}
+		pendingStagefileKey = null;
+	}
+
+	private void disposeGlResources() {
+		disposeGlResources(true);
 	}
 
 	@Override
 	public void render() {
+		// 后台(锁屏 / 切走)什么都不画:屏幕看不见,但列表字形布局、6 次 batch
+		// begin/end、频谱解析照样吃 CPU 并制造垃圾。省下的 CPU 和避免的 GC 都直接
+		// 让给音符调度线程 —— 播放才是锁屏时唯一要做的事。
+		if (backgrounded) return;
 		SpriteBatch batch = main.getSpriteBatch();
 		if (batch == null) return;
 
-		// 后台过渡时跳过了 GL 操作,stagefile 被标记为 null 且旧纹理暂存在
-		// stagefileToDispose;这里的 render() 肯定在 GL 线程上,所以一次清理 + 重新加载。
-		if (stagefileToDispose != null) {
-			stagefileToDispose.dispose();
-			stagefileToDispose = null;
-		}
-		if (stagefile == null && currentSong != null) {
-			loadStagefile();
-		}
+		// 切歌时后台线程把旧封面投递进队列了,GL 线程上统一释放。
+		drainRetiredTextures();
+		// 后台已经解码好的,这里只做上传(很快)。没有待上传的才自己解码 ——
+		// 正常路径下切歌时 worker 已经解好了,走到这里说明是刚进状态/从后台恢复。
+		// applyPendingStagefile() 内部会校验这张封面是否还属于当前歌曲:属于上一首的
+		// 会被丢掉,并清掉去重 key 让下一帧重新请求。
+		applyPendingStagefile();
+		ensureStagefileRequested();
 
 		// 1. 背景:深色
 		drawBackground(batch);
@@ -400,6 +865,9 @@ public class MusicPlayer extends MainState {
 		drawSongList(batch);
 		// 3. 舞台图(中央)
 		drawStagefile(batch);
+		// 3.5 加载提示。切歌时音频要重新解码(几百毫秒到几秒),这期间封面已经摘掉、
+		//     进度条也归零了 —— 不说明一下会像是卡住。
+		drawLoadingIndicator(batch);
 		// 4. 频谱(中部)
 		drawSpectrum(batch);
 		// 5. 进度条 + 时间文字
@@ -464,6 +932,31 @@ public class MusicPlayer extends MainState {
 		batch.begin();
 		batch.setColor(1, 1, 1, 1);
 		batch.draw(stagefile, x, y, STAGEFILE_W, STAGEFILE_H);
+		batch.end();
+	}
+
+	/**
+	 * 加载中的提示。
+	 *
+	 * 切歌时音频要重新解码(setModel() 那一步,几百毫秒到几秒),这期间列表高亮已经
+	 * 移到新歌、封面被摘掉、进度条归零 —— 不给个说明的话,用户看到的就是
+	 * "歌名变了但什么都没有",像是卡住了。
+	 *
+	 * 这也是"不要傻快"的另一半:切换本身没错,错的是切换过程中界面不说自己在干什么。
+	 * 只在 {@link #loading} 期间绘制,而且此时封面区本来就是空的,不会挡住任何东西。
+	 */
+	private void drawLoadingIndicator(SpriteBatch batch) {
+		if (!loading || font == null) return;
+		String text = "Loading...";
+		com.badlogic.gdx.graphics.g2d.GlyphLayout layout =
+				new com.badlogic.gdx.graphics.g2d.GlyphLayout(font, text);
+		float x = (skinW - STAGEFILE_W) / 2f;
+		float y = (skinH - STAGEFILE_H) / 2f;
+		batch.begin();
+		font.setColor(0.85f, 0.85f, 0.90f, 1f);
+		font.draw(batch, text,
+				x + (STAGEFILE_W - layout.width) / 2f,
+				y + STAGEFILE_H / 2f);
 		batch.end();
 	}
 
@@ -652,8 +1145,17 @@ public class MusicPlayer extends MainState {
 	}
 
 	private void handleListTouch() {
-		int gx = Gdx.input.getX();
-		int gy = skinH - Gdx.input.getY(); // 转 libGDX Y
+		// 坐标必须走 InputProcessor 的 mouse 坐标:它经过 screenToGame 变换
+		// (等比缩放 + pillarbox/letterbox 居中偏移),和 render() 画出来的位置是同一套坐标。
+		//
+		// 原来这里图省事用了 Gdx.input.getX()/getY(),那是**屏幕物理像素**,缺两步换算:
+		//   1. 缺缩放。皮肤 1280x720 在 2400x1080 的屏幕上会被放大 1.5 倍,而判定还按
+		//      720 的坐标算 —— 偏差随 y 增大而累积,点第 4 首会落到第 6 首
+		//      (行高 56,正好差两行)。上方按钮没这个问题,因为它们本来就用 getMouseX/Y。
+		//   2. 缺居中偏移。20:9 屏幕左右各有黑边,列表右半边换算回来落在判定范围之外,
+		//      表现就是"列表右边点不动、也滑不了"。
+		int gx = main.getInputProcessor().getMouseX();
+		int gy = main.getInputProcessor().getMouseY();
 		boolean touched = Gdx.input.isTouched() || Gdx.input.justTouched();
 
 		if (touched) {
@@ -702,11 +1204,13 @@ public class MusicPlayer extends MainState {
 	private int computeBarIndexAtTouch(int gy) {
 		if (allSongs == null || allSongs.length == 0) return -1;
 		int half = LIST_VISIBLE / 2;
-		// 绘制公式:row r 中心 y = baseRow0Y - r * LIST_LINE_H - listDragOffset
-		// (见 drawSongList) —— 反推 row 应该用 (baseRow0Y - gy) / LIST_LINE_H + listDragOffset / LIST_LINE_H
-		// 注意:滚动后内容向下移动(listDragOffset > 0)，所以要用 + 往回推算实际在那个位置的 row
+		// 绘制公式(drawSongList):row r 中心 y = baseRow0Y - r * LIST_LINE_H - listDragOffset
+		// 反推:row = (baseRow0Y - gy - listDragOffset) / LIST_LINE_H
+		// 注意是减 —— 内容被整体下移(listDragOffset > 0)时,同一个屏幕位置上放的是
+		// 更靠上(更小 row)的行。这里原来写成了加,只是靠"按下时 listDragOffset 必然
+		// 已被上一轮归零"侥幸不出错,别依赖这个巧合。
 		float baseRow0Y = skinH - LIST_TOP_Y - LIST_LINE_H * 0.5f;
-		int row = Math.round((baseRow0Y - gy) / LIST_LINE_H + listDragOffset / LIST_LINE_H);
+		int row = Math.round((baseRow0Y - gy - listDragOffset) / LIST_LINE_H);
 		if (row < 0 || row >= LIST_VISIBLE) return -1;
 		int idx = (selectedIndex + row - half + allSongs.length) % allSongs.length;
 		return idx;
@@ -718,38 +1222,13 @@ public class MusicPlayer extends MainState {
 		if (allSongs == null || selectedIndex < 0 || selectedIndex >= allSongs.length) return;
 		SongData next = allSongs[selectedIndex];
 		if (next == null) return;
-
-		shutdownResources();
-
-		this.currentSong = next;
-		this.currentModel = resource.loadBMSModel(
-				Gdx.files.absolute(currentSong.getPath()),
-				resource.getPlayerConfig().getLnmode());
-		if (this.currentModel == null) {
-			main.changeState(MainStateType.MUSICSELECT);
-			return;
-		}
-
-		// 换 wavmap 前先把所有在飞的 note 停掉(见 stopBgThread() 注释)
-		stopAllNotes();
-		main.getAudioProcessor().setModel(currentModel);
-		resource.setPlayMode(BMSPlayerMode.AUTOPLAY);
-
-		loadStagefile();
-
-		final int lastEventTime = currentModel.getLastTime();
-		final int lastNoteTime = currentModel.getLastNoteTime();
-		int tail = currentSong.getTail();
-		if (tail <= 0) {
-			tail = calculateMaxTailMs(currentModel, lastNoteTime);
-			currentSong.setTail(tail);
-			main.getSongDatabase().updateSongTail(currentModel.getSHA256(), tail);
-		}
-		this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + tail);
-		Gdx.app.log("MusicPlayer", "loadAndPlaySelected totalDurationMs: " + totalDurationMs + " ms, tail: " + tail + ", lastNoteTime: " + lastNoteTime + ", lastEventTime: " + lastEventTime);
-
-		this.playBaseNanos = System.nanoTime();
-		startBgThread(currentModel);
+		// 重活全交给 loader 线程:解析 BMS + setModel(解码几百个音源)+ 算 tail,
+		// 单首可能几百毫秒到几秒。留在这里会直接卡住 Choreographer
+		// (logcat 里的 "Skipped N frames!"),而随之而来的 stop-the-world GC
+		// 会把 BGAutoplayThread 一起暂停 —— 音符迟到,就是日志里的
+		// "BGAutoplay starved for Nms"。停旧线程 / 停音符 / 起新线程都由
+		// loadSingle() 在 loader 上完成,顺序不变。
+		requestLoad(selectedIndex, false);
 	}
 
 	private int hitTestControlButton(int gx, int gy) {
@@ -861,10 +1340,25 @@ public class MusicPlayer extends MainState {
 	 */
 	@Override
 	public void pause() {
+		// 锁屏 / 切走:立刻标记后台,render() 和封面解码都随之停手。
+		// 播放线程和 worker 上的切歌不受影响 —— 那才是锁屏时唯一该继续的事。
+		backgrounded = true;
+		// 主动关掉持续渲染。libGDX 通常会在 onPause 自己停掉 GL 线程,但不同设备
+		// 上 Surface 销毁有早有晚,这一段里的每帧绘制都是白烧 CPU。
+		if (Gdx.graphics != null) {
+			Gdx.graphics.setContinuousRendering(false);
+		}
+		// 现在释放舞台图。pause() 走 GL 线程且上下文此刻仍然有效,是安全的。
+		// 必须在这里放掉:后台时 render() 不再跑,而切歌仍会把旧纹理塞进
+		// stagefileToDispose 等 render 清理 —— 那就永远没人清,锁屏播一晚上
+		// 能攒下几十张纹理。
+		disposeGlResources(true);
 	}
 
 	@Override
 	public void resume() {
+		// 回到前台,恢复绘制(放在最前:下面的 disposeGlResources/schedule 都依赖它)
+		backgrounded = false;
 		// 从 standby / 切回前台 时,libGDX 会关掉持续渲染,这里重新打开
 		if (Gdx.graphics != null) {
 			Gdx.graphics.setContinuousRendering(true);
@@ -872,9 +1366,19 @@ public class MusicPlayer extends MainState {
 		// GL 上下文在后台被销毁重建过,本类持有的所有 Texture 句柄都已失效 ——
 		// 注意:失效的 Texture 对象不是 null,所以"== null 才重载"的老判断是错的,
 		// 必须无条件丢弃重来,否则回到前台第一帧就拿着野句柄去 draw。
-		disposeGlResources();
+		// 注意这里传 false:GL 上下文已经在后台被销毁重建过了,手上这些句柄全是
+		// 野指针,只能丢弃引用,不能拿去 dispose。
+		disposeGlResources(false);
 		if (currentSong != null) {
-			loadStagefile();
+			// 不要在这里同步解码封面。resume() 跑在 GL 线程上,解码一张封面动辄上百毫秒,
+			// 会把 Choreographer 卡住几百帧并触发 stop-the-world GC —— 而 GC 会顺带
+			// 暂停 BGAutoplayThread,表现正是"切回前台时音频断一下"。
+			// 丢给 worker,render() 只负责把结果上传成纹理(那很快)。
+			// 后台期间 decodeStagefile() 被跳过了,所以这里重新请求一次;同时把去重 key
+			// 一并写上,免得 render() 的 ensureStagefileRequested() 再多解一次同一张图。
+			String key = currentSong.getPath();
+			if (key != null) stagefileDecodeKey = key;
+			scheduleStagefileDecode();
 		}
 		// MainController.resume() 重新生成了 systemfont18,旧引用指向已 dispose 的对象;
 		// 重新拿一次,否则 font.draw() 引用失效纹理会导致渲染缺失。
@@ -907,8 +1411,11 @@ public class MusicPlayer extends MainState {
 			stagefile.dispose();
 			stagefile = null;
 		}
-		// stagefilePixmap 已经转 Texture,不需要单独 dispose
-		stagefilePixmap = null;
+		// 已解码但还没上传的那张也要放掉,否则退出时漏一份 native 内存
+		if (pendingStagefilePixmap != null) {
+			pendingStagefilePixmap.dispose();
+			pendingStagefilePixmap = null;
+		}
 		// 复位频谱
 		for (int i = 0; i < SPEC_BANDS; i++) {
 			specBands[i] = 0f;
@@ -931,11 +1438,22 @@ public class MusicPlayer extends MainState {
 	private void terminatePlayback() {
 		// 第一件事:置退出标志。worker 监视任务和 transition 都靠它早退。
 		disposed = true;
+		// 放开 CPU 锁:不放在最后是因为 shutdownResources() 里的 join 可能耗时,
+		// 没必要让 CPU 在这段时间一直被强行唤醒。
+		PlaybackCpuLockManager.release(this);
 		// 打断 worker 上的常驻监视任务(它在 sleep(200),shutdownNow 负责 interrupt)。
 		// 用 shutdownNow 而不是 shutdown:监视任务是死循环,shutdown 不会主动踢它。
 		if (worker != null) {
 			worker.shutdownNow();
 			worker = null;
+		}
+		advanceWatcherStarted = false;
+		// 加载线程也要关。shutdownNow 而不是 shutdown:正在跑的 job 可能正卡在
+		// setModel() 的解码里,不打断的话它会在 dispose 之后继续往 AudioDriver 里
+		// 灌一个已经退出状态的模型。任务内部有 disposed 检查,能尽快退出。
+		if (loader != null) {
+			loader.shutdownNow();
+			loader = null;
 		}
 		shutdownResources();
 		disposeGlResources();
@@ -1042,16 +1560,29 @@ public class MusicPlayer extends MainState {
 		private final MainController main;
 		volatile boolean stop = false;
 		private final long baseNanos;
-		/** 两次唤醒间隔超过这个毫秒数就认为被系统饿过一次,丢弃积压的 note */
+		/** 醒来时间比计划晚超过这个毫秒数就认为被系统饿过一次,丢弃积压的 note */
 		private static final long STARVE_THRESHOLD_MS = 500L;
+		/**
+		 * 单次 sleep 上限。只是为了防御 interrupt 丢失之类的意外,正常情况下
+		 * 靠 interrupt 打断,不需要靠短 sleep 来保持响应。
+		 */
+		private static final long MAX_SLEEP_MS = 2000L;
 
 		BGAutoplayThread(BMSModel model, MainController main, long baseNanos) {
 			this.model = model;
 			this.main = main;
 			this.baseNanos = baseNanos;
-			setName("MusicPlayer-BGAutoplay");
-			setDaemon(true);
+		setName("MusicPlayer-BGAutoplay");
+		setDaemon(true);
+		// 这个线程的唤醒精度就是音符的时序精度。默认优先级下它要和 GL 线程、GC、
+		// 扫描任务一起抢 CPU,锁屏后更是被 background cgroup 压到小核慢慢排队。
+		// 提到最高(Android 上约映射为 nice -8),让它尽量不被别的普通线程挤掉。
+		try {
+			setPriority(Thread.MAX_PRIORITY);
+		} catch (Throwable ignored) {
+			// 某些运行时不允许改优先级,忽略即可
 		}
+	}
 
 		@Override
 		public void run() {
@@ -1069,17 +1600,23 @@ public class MusicPlayer extends MainState {
 				TimeLine[] timelines = tls.toArray(TimeLine.class);
 
 				int p = 0;
-				long lastElapsedMs = 0;
+				// 上次"计划醒来"的时间点(相对 elapsedMs)。追赶保护必须拿它做基准,
+				// 不能用两次唤醒的间隔:去掉轮询上限后,曲子里的长静音段本来就会睡几秒,
+				// 按间隔判会误判成"被系统饿过",把静音段后的第一个音符丢掉 —— 漏音。
+				long scheduledWakeMs = 0;
 				while (!stop) {
 					long elapsedMs = (System.nanoTime() - baseNanos) / 1000000L;
 					long timeMicros = elapsedMs * 1000L;
 
-					final boolean starved = (elapsedMs - lastElapsedMs) > STARVE_THRESHOLD_MS;
+					// 实际醒来比计划晚太多 = 这段时间系统没给 CPU(锁屏/降频/被 throttle)。
+					// 积压的 note 不补播:一次性灌进 AudioDriver 会打满 soundpool、
+					// 让 Oboe 回调堆积,反而整段卡住。只推进游标,从当前时刻接着播。
+					long overshootMs = elapsedMs - scheduledWakeMs;
+					final boolean starved = overshootMs > STARVE_THRESHOLD_MS;
 					if (starved && Gdx.app != null) {
 						Gdx.app.log("MusicPlayer", "BGAutoplay starved for "
-								+ (elapsedMs - lastElapsedMs) + "ms, skipping backlog");
+								+ overshootMs + "ms, skipping backlog");
 					}
-					lastElapsedMs = elapsedMs;
 
 					while (p < timelines.length && timelines[p].getMicroTime() <= timeMicros) {
 						if (!starved) {
@@ -1100,11 +1637,25 @@ public class MusicPlayer extends MainState {
 						// 所有 note 已播完 → 线程自然退出,切歌等 worker 监视任务触发
 						break;
 					}
+
+					// 用"播放循环结束之后"的时间重算调度基准。循环本身可能耗时很久:
+					// 密集段落一次要发几百个 note,每个 audio.play() 都要过 JNI 并抢
+					// AudioDriver 的 monitor,几百毫秒很正常。不重算的话,这段耗时会被
+					// 下一轮原样算进 overshoot —— 一旦超过阈值就判定 starved 并丢掉
+					// 接下来的音符。表现出来就是"鼓点密的地方突然断一截",而且丢完
+					// 立刻又跑下一轮,自我强化、越丢越多。
+					elapsedMs = (System.nanoTime() - baseNanos) / 1000000L;
+					timeMicros = elapsedMs * 1000L;
+
+					// 直接睡到下一个音符,不再固定间隔轮询。
+					// 原来 10ms 上限意味着每秒约 100 次唤醒,绝大多数是空转(稀疏段落里
+					// 相邻音符常隔几百毫秒)。锁屏后 CPU 被压到小核并受 cgroup 限制,
+					// 这么高的唤醒频率正是最容易被 throttle 的目标 —— 一被限就是整批
+					// 音符迟到。停止走 interrupt(),长 sleep 照样能立刻打断。
 					long sleepMs = (timelines[p].getMicroTime() - timeMicros) / 1000L;
 					if (sleepMs < 1) sleepMs = 1;
-					// 上限从 5ms 放宽到 10ms:后台时系统定时器本来就没那么准,
-					// 5ms 的空转唤醒只是白烧 CPU,还给"被系统判定为异常耗电"加筹码
-					if (sleepMs > 10) sleepMs = 10;
+					if (sleepMs > MAX_SLEEP_MS) sleepMs = MAX_SLEEP_MS;
+					scheduledWakeMs = elapsedMs + sleepMs;
 					try {
 						sleep(sleepMs);
 					} catch (InterruptedException e) {
@@ -1150,117 +1701,147 @@ public class MusicPlayer extends MainState {
 		// 早期 disposed 检查 —— dispose() 已设 disposed=true 并在等锁,
 		// 本方法一拿到锁就该立刻放弃,不要白白加载 BMSModel / 算 tail / 设音频模型。
 		if (disposed) return false;
-		isTransitioning = true;
-		try {
-			// 1. 先停播放线程 + 停掉所有在飞的音符,然后才能安全地换 wavmap。
-			//    (旧实现漏了这一步,是崩溃的根源)
-			stopBgThread();
-			stopAllNotes();
+		// 与 loader 流水线共用同一把锁。
+		//
+		// 手动 PREV/NEXT 走 loadLock,曲尾自动切歌原本只靠 synchronized(this) ——
+		// 这是两把不同的锁,互不排斥。在曲尾附近点 NEXT 时两条路径会并发
+		// setModel():一个刚把 wavmap 换成新模型的,另一个还拿着旧引用在播,
+		// 而 setModel() 会 disposeOld() 释放 native PCM(Oboe),就是 use-after-free。
+		// 所以自动切歌必须进同一把 loadLock,和手动切歌真正串行起来。
+		synchronized (loadLock) {
+			isTransitioning = true;
+			try {
+				// 1. 先停播放线程 + 停掉所有在飞的音符,然后才能安全地换 wavmap。
+				//    (旧实现漏了这一步,是崩溃的根源)
+				stopBgThread();
+				stopAllNotes();
+				// 同步退出"正在播放"的显示态。后面 setModel() 要花几百毫秒到几秒,
+				// 不清的话进度条会拿上一首的基准继续往前跑(还会被 totalDurationMs 截到 100%)。
+				// 清零后进度条归零,render() 那边会画上 Loading 提示。
+				playBaseNanos = 0;
+				totalDurationMs = 0;
 
-			// 2. 按 playMode 推进到下一首(与 advanceByMode 同逻辑)
-			// 注意:先推进歌曲再清理 stagefile,确保 render() 如果在此期间运行
-			// 看到的是已更新的 currentSong,从而 loadStagefile() 加载正确的封面。
-			if (allSongs == null || allSongs.length == 0) {
-				// 置成一个永远到不了的值:否则 worker 监视任务会每 200ms 重新触发一次切歌,
-				// 变成死循环(加载失败 → 立刻再触发 → 再失败 …)
-				totalDurationMs = Long.MAX_VALUE;
-				Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
-				return true;
-			}
+				// 2. 按 playMode 推进到下一首(与 advanceByMode 同逻辑)
+				// 注意:先推进歌曲再清理 stagefile,确保 render() 如果在此期间运行
+				// 看到的是已更新的 currentSong,从而 loadStagefile() 加载正确的封面。
+				if (allSongs == null || allSongs.length == 0) {
+					// 置 0 让监视任务闭嘴(判据是 total > 0),否则它会每 200ms 重新触发
+					// 一次切歌,变成死循环(加载失败 → 立刻再触发 → 再失败 …)
+					silenceAdvanceWatcher();
+					Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
+					return true;
+				}
 
-			switch (playMode) {
-				case LOOP_ONE:
-					// 保持当前曲目,直接重启
-					break;
-				case RANDOM: {
-					if (allSongs.length > 1) {
-						java.util.Random rng = new java.util.Random();
-						int cur = selectedIndex;
-						int newIdx = cur;
-						for (int safety = 16; safety > 0 && newIdx == cur; safety--) {
-							newIdx = rng.nextInt(allSongs.length);
+				switch (playMode) {
+					case LOOP_ONE:
+						// 保持当前曲目,直接重启
+						break;
+					case RANDOM: {
+						if (allSongs.length > 1) {
+							java.util.Random rng = new java.util.Random();
+							int cur = selectedIndex;
+							int newIdx = cur;
+							for (int safety = 16; safety > 0 && newIdx == cur; safety--) {
+								newIdx = rng.nextInt(allSongs.length);
+							}
+							selectedIndex = newIdx;
 						}
-						selectedIndex = newIdx;
+						break;
 					}
-					break;
+					case SEQUENCE:
+					default:
+						selectedIndex = (selectedIndex + 1) % allSongs.length;
+						break;
 				}
-				case SEQUENCE:
-				default:
-					selectedIndex = (selectedIndex + 1) % allSongs.length;
-					break;
-			}
 
-			// 5. currentSong 已更新,在此之后清理 stagefile,保证 render() 若同时运行
-			// 看到的是新 currentSong,loadStagefile() 会加载正确封面。
-			this.currentSong = allSongs[selectedIndex];
-			if (currentSong == null) {
-				// 置成一个永远到不了的值:否则 worker 监视任务会每 200ms 重新触发一次切歌,
-				// 变成死循环(加载失败 → 立刻再触发 → 再失败 …)
-				totalDurationMs = Long.MAX_VALUE;
-				Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
-				return true;
-			}
+				// 5. currentSong 已更新,在此之后清理 stagefile,保证 render() 若同时运行
+				// 看到的是新 currentSong,loadStagefile() 会加载正确封面。
+				this.currentSong = allSongs[selectedIndex];
+				if (currentSong == null) {
+					// 置 0 让监视任务闭嘴(判据是 total > 0),否则它会每 200ms 重新触发
+					// 一次切歌,变成死循环(加载失败 → 立刻再触发 → 再失败 …)
+					silenceAdvanceWatcher();
+					Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
+					return true;
+				}
 
-			if (this.stagefile != null) {
-				this.stagefileToDispose = this.stagefile;
-				this.stagefile = null;
-				this.stagefilePixmap = null;
-			}
+				// 换歌了,旧封面必须立刻摘下来。以前这行和下面的解码一起被套在
+				// "if (stagefile != null)" 里,后果是:上一首解完还没上传(null)、
+				// 或者上一首没封面时,既不清也不解 —— 屏幕上一直挂着旧图,
+				// 新歌因此永远等不到自己的封面。摘除和解码是两件独立的事。
+				retireStagefile();
 
-			// 6. 加载新 BMSModel(纯文件 I/O + 解析,不需要 GL)
-			this.currentModel = resource.loadBMSModel(
-					Gdx.files.absolute(currentSong.getPath()),
-					resource.getPlayerConfig().getLnmode());
-			if (currentModel == null) {
-				// 置成一个永远到不了的值:否则 worker 监视任务会每 200ms 重新触发一次切歌,
-				// 变成死循环(加载失败 → 立刻再触发 → 再失败 …)
-				totalDurationMs = Long.MAX_VALUE;
-				Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
-				return true;
-			}
+				// 6. 加载新 BMSModel(纯文件 I/O + 解析,不需要 GL)
+				this.currentModel = resource.loadBMSModel(
+						Gdx.files.absolute(currentSong.getPath()),
+						resource.getPlayerConfig().getLnmode());
+				if (currentModel == null) {
+					// 置 0 让监视任务闭嘴(判据是 total > 0),否则它会每 200ms 重新触发
+					// 一次切歌,变成死循环(加载失败 → 立刻再触发 → 再失败 …)
+					silenceAdvanceWatcher();
+					Gdx.app.postRunnable(() -> main.changeState(MainStateType.MUSICSELECT));
+					return true;
+				}
 
-			// 7. 设置新音频模型(在飞的 note 已在第 1 步停掉,可以安全换 wavmap)
-			//    再查一次 disposed:setModel() 会占住 AudioDriver 的锁做完整解码(可能几百毫秒
-			//    ~数秒),期间 GL 线程再碰 audio 就会被挡住,没必要在退出时还锁一把。
-			if (disposed) return false;
-			main.getAudioProcessor().setModel(currentModel);
-			resource.setPlayMode(BMSPlayerMode.AUTOPLAY);
+				// 7. 设置新音频模型(在飞的 note 已在第 1 步停掉,可以安全换 wavmap)
+				//    再查一次 disposed:setModel() 会占住 AudioDriver 的锁做完整解码(可能几百毫秒
+				//    ~数秒),期间 GL 线程再碰 audio 就会被挡住,没必要在退出时还锁一把。
+				if (disposed) return false;
+				main.getAudioProcessor().setModel(currentModel);
+				resource.setPlayMode(BMSPlayerMode.AUTOPLAY);
 
-			// 8. 计算新时长:对齐 BMSPlayer 公式 Math.max(lastEventTime + 1000, lastNoteTime + tail)
-			final int lastEventTime = currentModel.getLastTime();
-			final int lastNoteTime = currentModel.getLastNoteTime();
-			int tail = currentSong.getTail();
-			if (tail <= 0) {
-				// 这一段会读几千个音频文件的头 + 写 SQLite,包一层容错:
-				// 后台数据库被别的线程占用时抛异常不能把整个切歌流程带崩
-				try {
-					tail = calculateMaxTailMs(currentModel, lastNoteTime);
-					currentSong.setTail(tail);
-					main.getSongDatabase().updateSongTail(currentModel.getSHA256(), tail);
-				} catch (Throwable e) {
-					if (Gdx.app != null) {
-						Gdx.app.error("MusicPlayer", "tail calculation failed", e);
+				// 8. 记下时长参数,准备把播放线程拉起来。
+				//    顺序很关键:tail 计算要读几千个音频头再写一次 SQLite,可能好几秒,
+				//    而它和封面解码都不发声。让它们挡在 startBgThread() 前面的话,
+				//    上一首早已播完、下一首迟迟不开始 —— 中间那几秒就是纯空白。
+				final int lastEventTime = currentModel.getLastTime();
+				final int lastNoteTime = currentModel.getLastNoteTime();
+				int tail = currentSong.getTail();
+
+				// 9. 启动新线程。dispose() 可能在第 6~8 步期间被调用过,这里再确认一次,
+				//    否则会起出一个没人管的孤儿播放线程。
+				if (disposed) return false;
+				this.playBaseNanos = System.nanoTime();
+				startBgThread(currentModel);
+				// 立刻给一个时长,让进度条从 0 开始正常走;精确值在方法末尾覆盖它。
+				// isTransitioning 要到 finally 才复位,监视任务碰不到这次赋值。
+				this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + Math.max(tail, 0));
+
+				// ---- 以下都不发声,放在播放线程起来之后 ----
+
+				// 趁还在 worker 线程上把新封面解好。别留给 render() 在主线程解码:
+				// 解码 + 随之而来的 GC 会卡住 Choreographer,而 stop-the-world GC
+				// 会把 BGAutoplayThread 一起暂停,音符整批迟到。
+				// 结果带归属标记;若上传前又切了歌,applyPendingStagefile() 会把它丢掉。
+				stagefileDecodeKey = currentSong.getPath();
+				decodeStagefile();
+
+				if (tail <= 0) {
+					// 这一段会读几千个音频文件的头 + 写 SQLite,包一层容错:
+					// 后台数据库被别的线程占用时抛异常不能把整个切歌流程带崩
+					try {
+						tail = calculateMaxTailMs(currentModel, lastNoteTime);
+						currentSong.setTail(tail);
+						main.getSongDatabase().updateSongTail(currentModel.getSHA256(), tail);
+					} catch (Throwable e) {
+						if (Gdx.app != null) {
+							Gdx.app.error("MusicPlayer", "tail calculation failed", e);
+						}
+						if (tail <= 0) tail = 1000;
 					}
-					if (tail <= 0) tail = 1000;
 				}
-			}
-			this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + tail);
-			Gdx.app.log("MusicPlayer", "transitionToNext totalDurationMs: " + totalDurationMs + " ms, tail: " + tail + ", lastNoteTime: " + lastNoteTime + ", lastEventTime: " + lastEventTime);
+				this.totalDurationMs = Math.max(lastEventTime + 1000, lastNoteTime + tail);
+				Gdx.app.log("MusicPlayer", "transitionToNext totalDurationMs: " + totalDurationMs + " ms, tail: " + tail + ", lastNoteTime: " + lastNoteTime + ", lastEventTime: " + lastEventTime);
 
-			// 9. 启动新线程。dispose() 可能在第 6~8 步期间被调用过,这里再确认一次,
-			//    否则会起出一个没人管的孤儿播放线程。
-			if (disposed) return false;
-			this.playBaseNanos = System.nanoTime();
-			startBgThread(currentModel);
-
-			// 10. 复位频谱(纯内存,无 GL)
-			for (int i = 0; i < SPEC_BANDS; i++) {
-				specBands[i] = 0f;
-				specTopValues[i] = 0f;
+				// 10. 复位频谱(纯内存,无 GL)
+				for (int i = 0; i < SPEC_BANDS; i++) {
+					specBands[i] = 0f;
+					specTopValues[i] = 0f;
+				}
+				return true;
+			} finally {
+				isTransitioning = false;
 			}
-			return true;
-		} finally {
-			isTransitioning = false;
 		}
 	}
 }

@@ -31,6 +31,7 @@ import com.badlogic.gdx.backends.android.surfaceview.GLSurfaceView20;
 import com.badlogic.gdx.backends.android.surfaceview.ResolutionStrategy;
 import com.badlogic.gdx.Input.Keys;
 import com.starxh.beatoraja.BeatorajaGame;
+import com.starxh.beatoraja.PlaybackCpuLockManager;
 import barsoosayque.libgdxoboe.OboeAudio;
 
 import java.io.*;
@@ -79,6 +80,58 @@ public class AndroidLauncher extends AndroidApplication {
     private volatile boolean isTextInputActive = false;
     private OboeAudio oboeAudio;
     private String mLanguage = "en";
+
+    /**
+     * Oboe 流的 pause/resume 专用后台线程。
+     *
+     * <p>oboe_engine 的 resume()/stop() 都要抢它自己那把 lifecycle 递归锁，而锁屏 / 切后台的
+     * 瞬间恰恰是音频设备变化的高发点（日志里的 "send audio device update msg"）：
+     * Oboe 回调线程收到 ErrorDisconnected 之后，会拿着这把锁在 connect_to_device() 里
+     * close + openStream，设备切换时这一步可以拖到秒级。</p>
+     *
+     * <p>在主线程（Activity 生命周期回调）同步调 resume()/pause() 就得等这把锁 ——
+     * 表现就是 logcat 里的 {@code Skipped 189 frames!}（约 3 秒主线程停顿）。</p>
+     *
+     * <p>流的状态切换本来也不需要同步语义：晚几十毫秒生效完全无害，而主线程一卡就是明显
+     * 掉帧。所以统一丢到这个 daemon 线程上执行；单线程保证 pause/resume 的相对顺序。</p>
+     */
+    private static final java.util.concurrent.ExecutorService OBOE_LIFECYCLE_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "OboeAudio-Lifecycle");
+                t.setDaemon(true);
+                return t;
+            });
+
+    /**
+     * 在后台线程切换 Oboe 流状态。绝不在主线程同步等待 native 锁。
+     *
+     * @param resume true = 让流保持/恢复 running；false = 停流
+     */
+    private void postOboeLifecycle(final boolean resume) {
+        // 在这里就把引用读进局部变量,让下面的 lambda 只捕获 OboeAudio 而不捕获
+        // this(Activity)。否则任务在队列里排队的这段时间,Activity 会一直被引用着
+        // 释放不掉。OboeAudio 是 createAudio() 里建出来的、与进程同寿命,不依赖 Activity。
+        final OboeAudio audio = oboeAudio;
+        if (audio == null) return;
+        try {
+            OBOE_LIFECYCLE_EXECUTOR.execute(() -> {
+                long startNanos = System.nanoTime();
+                try {
+                    if (resume) audio.resume(); else audio.pause();
+                } catch (Throwable t) {
+                    Log.w(TAG, "oboeAudio lifecycle failed", t);
+                }
+                long ms = (System.nanoTime() - startNanos) / 1000000L;
+                // 这条日志就是诊断依据:它越大,说明 native 侧重连/等锁越久。
+                // 它跑在自己的线程上,多慢都不会再变成 "Skipped N frames"。
+                if (ms > 50) {
+                    Log.i(TAG, "oboeAudio " + (resume ? "resume" : "pause") + " took " + ms + "ms");
+                }
+            });
+        } catch (Throwable t) {
+            Log.w(TAG, "postOboeLifecycle rejected", t);
+        }
+    }
 
     @Override
     public AndroidAudio createAudio(Context context, AndroidApplicationConfiguration config) {
@@ -235,6 +288,17 @@ public class AndroidLauncher extends AndroidApplication {
             Log.i(TAG, "Detected 32-bit device, using 30FPS limit for MusicSelect");
         } else {
             Log.i(TAG, "Detected 64-bit device, unlimited FPS enabled");
+        }
+
+        // 注入 CPU 保活实现(PARTIAL_WAKE_LOCK)。
+        // 注意 config.useWakelock 用的是 libGDX 的 FULL_WAKE_LOCK,而它在 AndroidApplication
+        // 的 onPause() 里会被 release —— 锁屏那一瞬间就没了,之后 CPU 进入低功耗,
+        // 音符调度线程唤醒精度崩掉,表现为音频不同步/停顿。这把锁的生命周期由
+        // MusicPlayer 自己管(create/terminate),与 Activity 生命周期无关。
+        try {
+            PlaybackCpuLockManager.setGlobalLock(new AndroidPlaybackCpuLock(this));
+        } catch (Throwable t) {
+            Log.w(TAG, "Failed to install playback CPU lock", t);
         }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -840,12 +904,18 @@ public class AndroidLauncher extends AndroidApplication {
 
     @Override
     protected void onResume() {
+        long superStartNanos = System.nanoTime();
         super.onResume();
-        // libGDX 默认的 audio lifecycle listener 已被 onCreate 清空,
-        // 这里手动确保 Oboe stream 处于 Started 状态。resume() 在已 Started 时是 noop。
-        if (oboeAudio != null) {
-            try { oboeAudio.resume(); } catch (Throwable t) { Log.w(TAG, "oboeAudio.resume failed", t); }
+        long superMs = (System.nanoTime() - superStartNanos) / 1000000L;
+        if (superMs > 50) {
+            // super.onResume() 里 libGDX 要等 GLSurfaceView 恢复。慢的话是框架侧的等待,
+            // 和 Oboe 无关 —— 分开报出来,免得和 postOboeLifecycle 的耗时混在一起看。
+            Log.i(TAG, "super.onResume took " + superMs + "ms");
         }
+        // libGDX 默认的 audio lifecycle listener 已被 onCreate 清空,这里手动确保 Oboe stream
+        // 处于 Started 状态。丢到后台线程做 —— 主线程等 native 锁会直接卡掉几秒渲染,
+        // 原因见 postOboeLifecycle 的注释。resume() 本身幂等(已 Started 时是 noop)。
+        postOboeLifecycle(true);
         if (!isTextInputActive) {
             getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN | WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING);
             suppressImeForGameInput();
@@ -925,17 +995,17 @@ public class AndroidLauncher extends AndroidApplication {
         } catch (Throwable t) {
             Log.w(TAG, "Failed to read current state in onPause", t);
         }
-        if (oboeAudio != null) {
-            try {
-                if (isMusicPlayer) {
-                    // 让流继续;resume() 幂等(已在 Started 时 noop)
-                    oboeAudio.resume();
-                } else {
-                    oboeAudio.pause();
-                }
-            } catch (Throwable t) { Log.w(TAG, "oboeAudio pause/resume failed", t); }
-        }
+        // 异步执行。锁屏那一瞬间 native 侧大概率正在抢 lifecycle 锁做设备重连
+        // (日志里的 "send audio device update msg"),主线程等它 = "Skipped 189 frames"。
+        // isMusicPlayer 恰好就是 resume 的语义:true 保持流 running,false 停流。
+        postOboeLifecycle(isMusicPlayer);
+
+        long superStartNanos = System.nanoTime();
         super.onPause();
+        long superMs = (System.nanoTime() - superStartNanos) / 1000000L;
+        if (superMs > 50) {
+            Log.i(TAG, "super.onPause took " + superMs + "ms");
+        }
     }
 
     @Override

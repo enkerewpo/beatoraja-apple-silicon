@@ -282,6 +282,67 @@ LR2 CSV  -> LR2SkinCSVLoader
 - JSON、Lua、LR2 三种输入是否需要一致行为。
 - Android GL context 恢复后的纹理重建。
 
+Lua 皮肤脚本里的相对路径按「`beatoraja.root` 数据根目录」语义解析（等价于桌面端的
+`user.dir`）。`LuaSkinLoader.installIoRedirect()` 在 `loadHeader()` 里统一把
+`io.open` / `io.lines` / `dofile` / `loadfile` 包装成多基准查找：
+脚本同目录 → `beatoraja.root` → 进程工作目录（保住桌面端）→ 写入兜底。
+
+这个重定向必须**对所有状态、所有 loader 生效**。它曾经被限制成只有 MusicSelect 皮肤
+才安装，于是 RESULT 皮肤读 `config_sys.json` 拿到 nil，直到很后面的一行才报
+`attempt to index ? (a nil value)` —— 报错位置离真正的失败点很远，极难排查。
+新增状态、或新增会读文件的皮肤类型时，不要再往这里加状态判断。
+详见 `docs/lua-skin-relative-path-fix.md`。
+
+Lua 皮肤脚本里出现 `java.awt.*` / `javax.imageio.*` / `javax.swing.*` 时，在 Android 上
+**必然**失败，这是平台缺失而非配置问题（android.jar 里 `javax/imageio`、`javax/swing`
+各 0 个类，`java/awt` 只剩 `font/NumericShaper`）。**引擎层无法也不应修复**：
+
+- 不能在 APK 里补一个 `java.awt.Color` 桩 —— `java.*` 是保留包名，类加载器直接抛
+  `SecurityException: Prohibited package name: java.awt`（已实测）。
+- `javax.imageio` 不在保留之列，但它依赖整条 AWT 图像栈
+  （`BufferedImage` / `Graphics2D` / `RenderingHints`），无桩可打。
+
+要注意这类绑定会**整屏**拖垮皮肤，而不只是丢一个功能：`bindClass` 通常写在模块顶层，
+而 require 链上没有 pcall，一处失败 → `SkinLoader.load()` 回退默认皮肤。
+皮肤侧的可行做法是把 `bindClass` 挪进 `pcall` 优雅降级，或改用 GDX `Pixmap` /
+平台 Intent 重新实现。诊断先看 logcat 的
+`SkinLua: luajava.bindClass fallback for <类名>` —— 它出现即说明该类在平台侧不存在。
+
+### 7.1.1 视口裁剪只能放在 draw 阶段
+
+`SkinObjectRenderer.setViewport()` / `SkinObjectRenderer.getCurrentViewport()` 是**本项目
+新增**的优化（上游 beatoraja 没有）：本意是让 `SkinObject.prepare()` 跳过视口外的元素。
+
+**它当初被放在了错误的位置。** `SkinObject.prepare()` 里拿 `region` 做判断时，`region`
+对一部分元素只是"模板坐标"，不是最终位置 —— 真实位置要等调用方在 `draw(sprite, offsetX,
+offsetY)` 里叠加偏移才算出来。两类元素的偏移时机不同：
+
+| 类 | 偏移在哪加 | `prepare()` 时 `region` 是否最终位置 |
+| --- | --- | --- |
+| `SkinImage` / `SkinNumber` | 各自的 `prepare(..., offsetX, offsetY)` | 是 |
+| `SkinText` / `SkinTextImage` | 只在 `draw(sprite, offsetX, offsetY)` 里 | **否（模板值）** |
+
+后果不只是"少画一个元素"，而是 **`draw=false` + `prepareColor()` 不执行** → `color`
+停在初始值 `new Color()` = `(0,0,0,0)` → `draw()` 的 `color.a == 0f` 守卫直接 return。
+表现为**整列 bar 标题消失，而背景条、等级数字都在**（后者是 `SkinImage`/`SkinNumber`，
+偏移时机不同所以没被误判）。
+
+现状：裁剪已挪到 `SkinObject` 的两个 draw 辅助方法里（此时 `tmpRect` 已是最终坐标），
+见 `SkinObject.checkViewport()`。**不要再把它加回 `prepare()`。**
+详见 `docs/lr2-skin-bar-title-cull-fix.md`。
+
+排查"某个元素整体不显示"时，另有两条独立路径值得先排除：
+
+1. `#DST_*` 行的**第 19~21 字段**（`values[18..20]` = op1/op2/op3）非 0 会被当成绘制条件。
+   命中标准选项 id（`1=FOLDERBAR`、`2=SONGBAR`、`3=GRADEBAR`…）时每帧判定；未命中时会在
+   `Skin.prepare()` 里因查不到 `#CUSTOMOPTION` 选中表而**整个对象被删除**（更隐蔽）。
+   注意 `#DST_BAR_*` 是逐行复用的模板，用"当前选中项类型"gate 它属错配，很多皮肤在那里留了
+   杂值。不过 `BarRenderer` 是直接调 `text.draw(...)`、**不检查 `draw` 标志**，所以该类杂值
+   对 bar 文字实际上是惰性的。
+2. 元素是否因为**坐标公式的坐标系不同**而被误判/画错位置：`LR2SelectSkinLoader` 里
+   `#DST_BAR_TITLE` 用的是相对 y（`-(y+h)*dsth/srch`，可为负），其余 bar 元素用绝对 y
+   （`dsth - (y+h)*dsth/srch`）。
+
 ## 8. 输入系统
 
 `BMSPlayerInputProcessor` 统一管理：
@@ -324,6 +385,18 @@ LockSupport.parkNanos(...)
 - 不要在 `BMSPlayer.render()` / `STATE_PLAY` 中重新按渲染帧写 `TIMER_PLAY`；同类问题先读
   `docs/judge-clock-skew-analysis.md`。
 
+触摸坐标相关约束：
+
+- **自定义绘制的触摸判定必须用 `main.getInputProcessor().getMouseX()/getMouseY()`**，
+  不要用 `Gdx.input.getX()/getY()`。后者是屏幕物理像素；前者才经过
+  `convertScreenX/Y` → `MainController.screenToGameX/Y` 的"等比缩放 +
+  pillarbox/letterbox 居中偏移"变换，和 `render()` 用的是同一套坐标。
+- 两者混用的后果是"看起来能用、实则整体错位"：缺缩放会让纵向命中随 y 累积偏移
+  （MusicPlayer 列表上表现为点第 4 首选到第 6 首），缺居中偏移会让横向判定范围缩水
+  （列表右半边画着却点不到，拖拽也起不来）。
+- `mousey` 的语义已经是 libGDX 方向（`resolution.height - gameY`），不要再翻一次。
+- 排查同类问题先读 `docs/musicplayer-stagefile-and-stutter-fix.md` 第三节。
+
 ## 9. 音频与频谱
 
 ### 9.1 音频注入
@@ -359,6 +432,34 @@ PCM。Android 上 PCM 是 native 对象（libgdx-oboe `OboeSound`），所以：
 
 MusicPlayer（后台 autoplay）是唯一在后台线程换模型的状态，其交接协议与后台断音 / 闪退的
 修复细节见 `docs/musicplayer-background-fix.md`。
+
+### 9.1.2 Oboe 音源注册与 `active()` 约定
+
+native 侧的模型和 Java 侧很容易搞混，这里记清楚：
+
+- **每个 wav 文件解码成一个独立的 `soundpool`**，通过 `audio_player::play_audio()` 注册进
+  `m_tracks`。一首 BMS 有几百到几千个 wav，所以 `m_tracks` 是几千个元素的 `weak_ptr` 数组。
+- **每个 note 的 `play` 只是往对应 pool 的 `m_pending` 里塞一个 voice**（无锁），
+  真正的混音在 Oboe 回调线程的 `audio_player::generate_audio()` 里做。
+- `generate_audio()` 约每 4ms 被调一次，**持着 `audio_player` 的自旋锁**遍历 `m_tracks`。
+
+因此遍历里有一句 `if (!track->active()) continue;`：几千个 pool 同时只有几十个在响，
+不跳过的话每帧都要为每个空闲 pool 清一次混音缓冲并跑一遍 `render()`，
+在约 250Hz 下就是每秒几百 MB 的无谓内存写入，全部落在实时音频线程上。
+
+**修改约束**：`renderable_audio` 的子类必须正确实现 `active()` ——
+
+- 返回 `true` 但实际没有输出 → 白耗 CPU，正是上面要避免的；
+- 返回 `false` 但实际还有输出 → **丢音**（该 pool 这一帧完全不参与混音）。
+- `soundpool` 的判定是 `!m_sounds.empty() || !m_pending.empty()`：`m_pending` 必须算进去，
+  否则刚 `play` 还没来得及入池的 voice 会被永久跳过。
+- 默认实现是 `true`（保守），流式播放的 `music` 沿用默认值。
+
+源码在 `libgdx-oboe`（submodule，指向 `github.com/starxh-1/libgdx-oboe`）。
+改了 C++ 必须重编译并替换 `android/libs/libgdx-oboe.aar`；FFmpeg 预编译库已在
+`libgdx-oboe/library/libs/`，不需要重建。子模块自带的 `gradlew` 的 wrapper jar 不可用，
+用本地已下载的 Gradle 8.14.3 直接跑 `:library:assembleRelease` 即可
+（详细命令见 `docs/musicplayer-stagefile-and-stutter-fix.md`）。
 
 ### 9.2 频谱
 
@@ -493,6 +594,7 @@ Download/beatoraja/
 
 `AndroidLauncher` 将私有外部目录写入系统属性 `beatoraja.root`。
 `Config` 和 `PlayerConfig` 依赖这个属性解析配置、玩家和相对资源路径。
+Lua 皮肤脚本的 `io.open` / `dofile` 等相对路径也以它为基准（见 7.1 节）。
 
 ### 11.3 设置页
 

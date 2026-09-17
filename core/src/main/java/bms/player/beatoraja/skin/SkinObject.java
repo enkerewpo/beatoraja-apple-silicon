@@ -520,16 +520,32 @@ public abstract class SkinObject extends DisposableObject {
 			return;
 		}
 
-		// 可见性裁剪：跳过视口外的元素
-		Rectangle vp = Skin.SkinObjectRenderer.getCurrentViewport();
-		if (vp != null && (region.x + region.width < vp.x || region.x > vp.x + vp.width ||
-				region.y + region.height < vp.y || region.y > vp.y + vp.height)) {
-			draw = false;
-			return;
-		}
-
+		// 注意：不要把"视口裁剪"放在这里。
+		//
+		// 此时 region 对 SkinText 只是"模板坐标"：LR2 的 bar 元素（#DST_BAR_*）坐标是相对
+		// 条顶的，真实位置要等调用方在 draw(sprite, offsetX, offsetY) 里加上行偏移才算出来。
+		// （SkinImage / SkinNumber 是在各自的 prepare(..., offsetX, offsetY) 里加偏移，所以
+		// 它们的 region 已经是最终坐标，看起来"正常"；SkinText 不是，两者行为因此分裂。）
+		//
+		// 在这里按 region 裁剪，会把 bar 标题整列误判成视口外：draw=false，且 prepareColor()
+		// 从此不执行，color 停在初始值 new Color()=(0,0,0,0)，于是 draw() 的 color.a==0f
+		// 守卫直接 return —— 表现为"整列歌单标题不显示，但背景条和等级数字都正常"。
+		// 正确位置是真正知道最终坐标的 draw 辅助方法，见 checkViewport()。
 		prepareColor();
 		prepareAngle();
+	}
+
+	/**
+	 * 视口裁剪：元素完全落在可视区域外时返回 false，调用方跳过绘制。
+	 *
+	 * <p>必须在**已经算出最终绘制坐标**的地方调用（各 draw 辅助方法里）。不要在
+	 * {@link #prepare(long, MainState, float, float)} 里拿 {@link #region} 判断 ——
+	 * 对 SkinText 这类"模板坐标 + draw 时叠加偏移"的元素，region 并不是最终位置。</p>
+	 */
+	private static boolean checkViewport(Rectangle rect) {
+		Rectangle vp = Skin.SkinObjectRenderer.getCurrentViewport();
+		return vp == null || !(rect.x + rect.width < vp.x || rect.x > vp.x + vp.width
+				|| rect.y + rect.height < vp.y || rect.y > vp.y + vp.height);
 	}
 
 	public abstract void draw(SkinObjectRenderer sprite);
@@ -542,6 +558,9 @@ public abstract class SkinObject extends DisposableObject {
 		tmpRect.set(region);
 		if(stretch != null) {
 			stretch.stretchRect(tmpRect, tmpImage, image);
+		}
+		if (!checkViewport(tmpRect)) {
+			return;
 		}
 		sprite.setColor(color);
 		sprite.setBlend(dstblend);
@@ -568,6 +587,9 @@ public abstract class SkinObject extends DisposableObject {
 		tmpRect.set(x, y, width, height);
 		if(stretch != null) {
 			stretch.stretchRect(tmpRect, tmpImage, image);
+		}
+		if (!checkViewport(tmpRect)) {
+			return;
 		}
 		sprite.setColor(color);
 		sprite.setBlend(dstblend);

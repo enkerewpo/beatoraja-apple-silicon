@@ -301,21 +301,33 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 	/**
 	 * BMSの音源データを読み込む
 	 *
+	 * <p><b>为什么这个方法被拆成"锁外解码 + 短临界区替换":</b>
+	 * {@code play(Note,float,int)} / {@code stop(Note)} 是 synchronized —— 它们和本方法抢
+	 * 同一把 monitor。旧实现让本方法在<b>持有 monitor 的状态下</b>完成全部并行解码,于是
+	 * 解码的几百毫秒~数秒里,任何想发声的线程都被堵在这里,音符整批迟到。这正是
+	 * "BGAutoplay starved for 1771ms" 的来源:不是线程没被调度,是它卡在 monitor 上。
+	 *
+	 * <p>新的结构是:
+	 * <ol>
+	 *   <li>阶段 A:先短暂持锁做旧 PCM 释放(必须与后面的解码隔开,否则峰值内存翻倍),
+	 *       然后<b>不持锁</b>做并行解码 —— 结果写进<b>局部数组</b>,字段在此期间完全不变,
+	 *       播放线程看到的始终是上一份完整可用的 wavmap;</li>
+	 *   <li>阶段 B:极短的临界区,只做数组引用替换。</li>
+	 * </ol>
+	 * 这样 monitor 的持有时间从"整场解码"降到"一次引用赋值"。
+	 *
 	 * @param model
 	 */
-	public synchronized void setModel(BMSModel model) {
+	public void setModel(BMSModel model) {
 		Logger.getGlobal().info("音源ファイル読み込み開始。");
+		final long startNanos = System.nanoTime();
 
 		// 如果是同一首歌，跳过缓存释放以加速加载（Retry 优化）
-		if (model.getMD5() == null || !model.getMD5().equals(lastModelMD5)) {
-			cache.disposeOld();
-			lastModelMD5 = model.getMD5() != null ? model.getMD5() : "";
-		}
+		final boolean modelChanged = model.getMD5() == null || !model.getMD5().equals(lastModelMD5);
 
 		String[] wavlist = model.getWavList();
 		final int wavcount = wavlist.length;
 		boolean use_defaultsound = false;
-		Array<SliceWav<T>>[] slicesound;
 
 		progress = new AtomicInteger();
 		noteMapSize = 0;
@@ -351,18 +363,25 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 				addNoteList(notemap, n);
 			}
 		}
-		if (use_defaultsound) {
-			wavmap = (T[]) new Object[wavcount+1];
-			this.slicesound = new SliceWav[wavcount+1][];
-			slicesound = new Array[wavcount+1];
-		} else {
-			wavmap = (T[]) new Object[wavcount];
-			this.slicesound = new SliceWav[wavcount][];
-			slicesound = new Array[wavcount];
-		}
+		final int size = use_defaultsound ? wavcount + 1 : wavcount;
+		// ★ 解码期间绝不改字段:全部写进局部数组,保证对外仍是"上一份完整的 wavmap"
+		@SuppressWarnings("unchecked")
+		final T[] newWavmap = (T[]) new Object[size];
+		@SuppressWarnings("unchecked")
+		final Array<SliceWav<T>>[] newSlicesound = (Array<SliceWav<T>>[]) new Array[size];
 		noteMapSize = notemap.size;
 		Map<Integer, List<Note>> map = new HashMap<>();
 		notemap.iterator().forEachRemaining(m -> map.put(m.key, m.value));
+
+		// ---- 阶段 A 前半:短暂持锁。旧 PCM 必须先释放,否则跟新解码叠加会导致峰值内存翻倍 ----
+		if (modelChanged) {
+			synchronized (this) {
+				lastModelMD5 = model.getMD5() != null ? model.getMD5() : "";
+				cache.disposeOld();
+			}
+		}
+
+		// ---- 阶段 A 后半:不持锁的并行解码(耗时主体,数百个音源文件的解压) ----
 		map.entrySet().parallelStream().forEach(waventry -> {
 			final int wavid = waventry.getKey();
 			if (progress.get() >= noteMapSize) {
@@ -388,17 +407,17 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 					// 音切りあり・なし両方のデータが必要になるケースがある
 					if (note.getMicroStarttime() == 0 && note.getMicroDuration() == 0) {
 						// 音切りなしのケース
-						wavmap[wavid] = cache.get(new AudioKey(p, note));
-						if (wavmap[wavid] == null) {
+						newWavmap[wavid] = cache.get(new AudioKey(p, note));
+						if (newWavmap[wavid] == null) {
 							break;
 						}
 					} else {
 						// 音切りありのケース
 						boolean b = true;
-						if (slicesound[note.getWav()] == null) {
-							slicesound[note.getWav()] = new Array<SliceWav<T>>();
+						if (newSlicesound[note.getWav()] == null) {
+							newSlicesound[note.getWav()] = new Array<SliceWav<T>>();
 						}
-						for (SliceWav<T> slice : slicesound[note.getWav()]) {
+						for (SliceWav<T> slice : newSlicesound[note.getWav()]) {
 							if (slice.starttime == note.getMicroStarttime() && slice.duration == note.getMicroDuration()) {
 								b = false;
 								break;
@@ -407,7 +426,7 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 						if (b) {
 							T sliceaudio = cache.get(new AudioKey(p, note));
 							if (sliceaudio != null) {
-								slicesound[note.getWav()].add(new SliceWav<T>(note, sliceaudio));
+								newSlicesound[note.getWav()].add(new SliceWav<T>(note, sliceaudio));
 							} else {
 								return;
 							}
@@ -420,18 +439,30 @@ public abstract class AbstractAudioDriver<T> implements AudioDriver {
 			progress.incrementAndGet();
 		});
 
-		Logger.getGlobal().info("音源ファイル読み込み完了。音源数:" + wavmap.length);
-		for (int i = 0; i < wavmap.length; i++) {
-			if (slicesound[i] != null) {
-				this.slicesound[i] = slicesound[i].toArray(SliceWav.class);
+		final SliceWav<T>[][] newSlicesoundArray = new SliceWav[size][];
+		for (int i = 0; i < size; i++) {
+			if (newSlicesound[i] != null) {
+				newSlicesoundArray[i] = newSlicesound[i].toArray(SliceWav.class);
 			} else {
-				this.slicesound[i] = new SliceWav[0];
+				newSlicesoundArray[i] = new SliceWav[0];
 			}
 		}
 
+		// ---- 阶段 B:极短临界区,只换引用。CRITICAL_SECTION 之外的时间都不阻塞发声 ----
+		synchronized (this) {
+			wavmap = newWavmap;
+			slicesound = newSlicesoundArray;
+		}
+
 		final int prevsize = cache.size();
-		cache.disposeOld();
-		Logger.getGlobal().info("AudioCache容量 : " + cache.size() + " 開放 : " + (prevsize - cache.size()));
+		// 必须持锁:disposeOld() 会真正释放 PCM。锁外执行的话,play() 可能正拿着
+		// 某个即将被释放的对象在发声 —— 又是 use-after-free。
+		synchronized (this) {
+			cache.disposeOld();
+		}
+		final long elapsedMs = (System.nanoTime() - startNanos) / 1000000L;
+		Logger.getGlobal().info("音源ファイル読み込み完了。音源数:" + size + " 所要 " + elapsedMs
+				+ "ms, AudioCache容量 : " + cache.size() + " 開放 : " + (prevsize - cache.size()));
 
 		progress.set(noteMapSize);
 	}
