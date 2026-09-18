@@ -3,6 +3,7 @@ package bms.player.beatoraja.select;
 import bms.player.beatoraja.Resolution;
 import bms.player.beatoraja.input.KeyBoardInputProcesseor.ControlKeys;
 import bms.player.beatoraja.select.bar.SearchWordBar;
+import bms.player.beatoraja.skin.Skin;
 
 import java.util.logging.Logger;
 
@@ -22,6 +23,8 @@ import com.badlogic.gdx.scenes.scene2d.utils.FocusListener;
 import com.badlogic.gdx.scenes.scene2d.utils.TextureRegionDrawable;
 import com.badlogic.gdx.utils.GdxRuntimeException;
 import com.badlogic.gdx.utils.viewport.FitViewport;
+import com.badlogic.gdx.utils.viewport.StretchViewport;
+import com.badlogic.gdx.utils.viewport.Viewport;
 
 /**
  * 楽曲検索用テキストフィールド
@@ -49,8 +52,33 @@ public class SearchTextField extends Stage {
 	 */
 	private Group screen;
 
+	/**
+	 * 构造与主渲染完全一致的视口:
+	 * <ul>
+	 *   <li>世界尺寸用<b>皮肤分辨率</b>而非 config.resolution —— 搜索框区域 r 是从 LR2 模板
+	 *       坐标换算到皮肤空间的（LR2SkinCSVLoader: dstw/dsth），主渲染的投影也是
+	 *       setToOrtho2D(0,0,skinW,skinH)。若这里用 config.resolution(默认 HD)，皮肤是
+	 *       FULLHD/SD 时两者坐标空间不一致，纵向（以及横向）就对不齐。</li>
+	 *   <li>拉伸全屏(config.stretchFullscreen)时主渲染把皮肤线性铺满整个 surface，
+	 *       对应 StretchViewport；等比模式下是 FitViewport（与 MainController 的
+	 *       pillarbox/letterbox 计算等价）。</li>
+	 * </ul>
+	 */
+	private static Viewport createViewport(MusicSelector selector, Resolution resolution) {
+		Skin skin = selector.getSkin();
+		float w = skin != null ? skin.getWidth() : 0;
+		float h = skin != null ? skin.getHeight() : 0;
+		if (w <= 0 || h <= 0) { // 皮肤未声明尺寸时回退到 config 分辨率
+			w = resolution.width;
+			h = resolution.height;
+		}
+		boolean stretch = selector.main != null && selector.main.getConfig() != null
+				&& selector.main.getConfig().isStretchFullscreen();
+		return stretch ? new StretchViewport(w, h) : new FitViewport(w, h);
+	}
+
 	public SearchTextField(MusicSelector selector, Resolution resolution) {
-		super(new FitViewport(resolution.width, resolution.height));
+		super(createViewport(selector, resolution));
 		this.selector = selector;
 
 		final Rectangle r = ((MusicSelectSkin) selector.getSkin()).getSearchTextRegion();
@@ -164,7 +192,8 @@ public class SearchTextField extends Stage {
 			});
 
 			screen = new Group();
-			screen.setBounds(0, 0, resolution.width, resolution.height);
+			// 世界坐标 = 皮肤空间（与 r 一致），全屏点击判定才不会错位
+			screen.setBounds(0, 0, getViewport().getWorldWidth(), getViewport().getWorldHeight());
 			screen.addListener(new ClickListener() {
 				@Override
 				public boolean touchDown(InputEvent event, float x, float y, int pointer, int button) {

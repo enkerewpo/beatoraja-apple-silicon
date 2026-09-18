@@ -196,10 +196,13 @@ public class KeyConfiguration extends MainState {
 			}
 			for (BMControllerInputProcessor bmc : controllers) {
 				if (keyinput && bmc.getLastPressedButton() != -1) {
+					// 先取按钮号：setControllerKeyAssign() 内部会把它消费成 -1，
+					// 之后再取日志里就只剩 "----"
+					final int pressedBtn = bmc.getLastPressedButton();
 					setControllerKeyAssign(currentKeysa[cursorpos], bmc);
 					// 显示配置信息
 					String keyName = currentKeys[cursorpos >= 0 && cursorpos < currentKeys.length ? cursorpos : 0]; // 仅用于日志,cursorpos 已由 KEYSA.length 约束,越界时回退 0
-					String buttonName = BMControllerInputProcessor.BMKeys.toString(bmc.getLastPressedButton());
+					String buttonName = BMControllerInputProcessor.BMKeys.toString(pressedBtn);
 					String controllerType = XboxControllerHelper.isXboxController(bmc.getName()) ? "XBOX" : "Gamepad";
 					Gdx.app.log("KeyConfig", "Mapped " + controllerType + " [" + bmc.getName() + "] "
 						+ buttonName + " -> " + keyName);
@@ -712,15 +715,33 @@ public class KeyConfiguration extends MainState {
 		if (cindex < 0) {
 			return;
 		}
-		resetKeyAssign(index);
 		int newBtn = bmc.getLastPressedButton();
-		if (index >= 0) {
-			controllerConfigs[cindex].getKeyAssign()[index] = newBtn;
-		} else if (index == -1) {
-			controllerConfigs[cindex].setStart(newBtn);
-		} else if (index == -2) {
-			controllerConfigs[cindex].setSelect(newBtn);
+		// SCR 槽位(F-SCR/R-SCR/WHEEL 等)支持多键 pack,与键盘槽位行为一致 ——
+		// 例如同一个转盘可同时绑两个手柄按钮(按下任一即触发)。
+		// packKey() 用 8 bits/slot 编码,要求 ID < 256:BMKeys.MAXID = 256 满足;
+		// BMControllerInputProcessor.isPackedPressed() 与 BMKeys.toString() 都已是打包感知的。
+		// 普通键槽位仍按 upstream reset+direct set(后按覆盖先按)。
+		if (isScratchKeySlot(index)) {
+			if (index >= 0) {
+				controllerConfigs[cindex].getKeyAssign()[index] = packKey(
+						controllerConfigs[cindex].getKeyAssign()[index], newBtn);
+			} else if (index == -1) {
+				controllerConfigs[cindex].setStart(packKey(controllerConfigs[cindex].getStart(), newBtn));
+			} else if (index == -2) {
+				controllerConfigs[cindex].setSelect(packKey(controllerConfigs[cindex].getSelect(), newBtn));
+			}
+		} else {
+			resetKeyAssign(index);
+			if (index >= 0) {
+				controllerConfigs[cindex].getKeyAssign()[index] = newBtn;
+			} else if (index == -1) {
+				controllerConfigs[cindex].setStart(newBtn);
+			} else if (index == -2) {
+				controllerConfigs[cindex].setSelect(newBtn);
+			}
 		}
+		// 立即把新配置推给运行中的处理器，无需等到下次 updateControllers
+		bmc.setConfig(controllerConfigs[cindex]);
 		// 消费 lastPressedButton,防止下一帧 pollControllerNavShortcuts 把它当 nav 快捷键
 		bmc.setLastPressedButton(-1);
 	}
