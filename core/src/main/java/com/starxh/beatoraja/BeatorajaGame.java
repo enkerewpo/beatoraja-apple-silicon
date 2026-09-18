@@ -54,21 +54,31 @@ public class BeatorajaGame extends ApplicationAdapter {
             controller.render();
         }
 
-        // 渲染频谱（仅在游玩和结果界面显示，且配置中启用了频谱）
+        // 渲染频谱：只在游玩（PLAY）界面显示。
+        // 调整页同样只在 PLAY 可进入（FloatingMenu 的入口项仅 PLAY 可见），
+        // 所以这里无需为"其他界面预览"开特例。
         if (spectrumRenderer != null && controller != null) {
             MainState state = controller.getCurrentState();
-            if (state != null && (state instanceof BMSPlayer)) {
+            if (state instanceof BMSPlayer) {
                 Config cfg = controller.getConfig();
                 if (cfg != null && cfg.getAudioVisualizationMode() != Config.MODE_OFF) {
-                    configureSpectrumRenderer(cfg);
+                    configureSpectrumRenderer(cfg, controller.isSpectrumAdjustOpen());
                     spectrumRenderer.render();
                 }
             }
         }
     }
 
-    private void configureSpectrumRenderer(Config cfg) {
+    private void configureSpectrumRenderer(Config cfg, boolean adjusting) {
         spectrumRenderer.setMode(cfg.getAudioVisualizationMode());
+
+        // 频谱坐标所处的空间 = 皮肤 header 的 w/h，加上主渲染当前的真实视口矩形。
+        // 两者必须每帧同步：皮肤可能是 1280x720 / 1920x1080，且开启"拉伸全屏"时
+        // 视口不再等于等比矩形 —— 频谱区域要按同一套映射贴到屏幕上。
+        if (controller != null) {
+            spectrumRenderer.setViewportRect(controller.getViewportX(), controller.getViewportY(),
+                    controller.getViewportW(), controller.getViewportH());
+        }
 
         // 检查当前 skin 的 In-Game Spectrum 选项是否开启
         boolean inGameSpectrumOption = true;
@@ -77,6 +87,7 @@ public class BeatorajaGame extends ApplicationAdapter {
             if (state != null) {
                 bms.player.beatoraja.skin.Skin skin = state.getSkin();
                 if (skin != null && skin.header != null) {
+                    spectrumRenderer.setSkinSpace(skin.getWidth(), skin.getHeight());
                     bms.player.beatoraja.skin.SkinHeader.CustomOption[] options = skin.header.getCustomOptions();
                     if (options != null) {
                         for (bms.player.beatoraja.skin.SkinHeader.CustomOption opt : options) {
@@ -94,51 +105,13 @@ public class BeatorajaGame extends ApplicationAdapter {
 
         // 检查当前 skin 是否有 spectrum offset (id=60)
         boolean skinHasSpectrum = false;
-        float specX = 0, specY = 0, specW = 0, specH = 0;
+        int[] area = InGameSpectrumConfig.resolve(controller);
 
         if (controller != null) {
             MainState state = controller.getCurrentState();
             if (state != null) {
                 bms.player.beatoraja.skin.Skin skin = state.getSkin();
                 if (skin != null && skin.header != null) {
-                    bms.player.beatoraja.skin.SkinType skinType = skin.header.getSkinType();
-                    bms.player.beatoraja.SkinConfig sc = controller.getPlayerConfig().getSkin()[skinType.getId()];
-
-                    // 读取 skin 目录下的 spectrumconfig.json 作为辅助配置
-                    float configX = 0, configY = 0, configW = 0, configH = 0;
-                    try {
-                        File configFile = null;
-                        if (sc != null && sc.getPath() != null) {
-                            File parent = new File(sc.getPath()).getParentFile();
-                            if (parent != null) {
-                                configFile = new File(parent, "spectrumconfig.json");
-                            }
-                        }
-                        if (configFile == null || !configFile.exists()) {
-                            // 尝试从 skin header 的 path 获取
-                            String headerPath = skin.header.getPath();
-                            if (headerPath != null) {
-                                File headerParent = new File(headerPath).getParentFile();
-                                if (headerParent != null) {
-                                    configFile = new File(headerParent, "spectrumconfig.json");
-                                }
-                            }
-                        }
-                        if (configFile != null && configFile.exists()) {
-                            byte[] data = readFile(configFile);
-                            String json = new String(data, java.nio.charset.StandardCharsets.UTF_8);
-                            com.badlogic.gdx.utils.JsonValue jsonValue = new com.badlogic.gdx.utils.JsonReader().parse(json);
-                            if (jsonValue != null) {
-                                if (jsonValue.has("x")) configX = jsonValue.getFloat("x");
-                                if (jsonValue.has("y")) configY = jsonValue.getFloat("y");
-                                if (jsonValue.has("w")) configW = jsonValue.getFloat("w");
-                                if (jsonValue.has("h")) configH = jsonValue.getFloat("h");
-                            }
-                        }
-                    } catch (Exception e) {
-                        com.badlogic.gdx.Gdx.app.log("Spectrum", "Failed to read spectrumconfig.json: " + e.getMessage());
-                    }
-
                     // 检查 skin 是否支持 spectrum（通过 skin header 的 CustomOffset 定义）
                     bms.player.beatoraja.skin.SkinHeader.CustomOffset[] offsets = skin.header.getCustomOffsets();
                     if (offsets != null) {
@@ -149,31 +122,17 @@ public class BeatorajaGame extends ApplicationAdapter {
                             }
                         }
                     }
-
-                    // 直接用 PlayerConfig > json > hardcoded
-                    bms.player.beatoraja.PlayerConfig playerConfig = controller.getPlayerConfig();
-                    int pX = playerConfig != null ? playerConfig.getSpectrumOffsetX() : 0;
-                    int pY = playerConfig != null ? playerConfig.getSpectrumOffsetY() : 0;
-                    int pW = playerConfig != null ? playerConfig.getSpectrumOffsetW() : 0;
-                    int pH = playerConfig != null ? playerConfig.getSpectrumOffsetH() : 0;
-
-                    if (pX != 0) specX = pX;
-                    else if (configX != 0) specX = configX;
-                    else specX = 680;
-
-                    if (pY != 0) specY = pY;
-                    else if (configY != 0) specY = configY;
-                    else specY = 10;
-
-                    if (pW != 0) specW = pW;
-                    else if (configW != 0) specW = configW;
-                    else specW = 320;
-
-                    if (pH != 0) specH = pH;
-                    else if (configH != 0) specH = configH;
-                    else specH = 80;
                 }
             }
+        }
+
+        // 调整页打开时无条件按游戏内区域渲染：即使皮肤把 In-Game Spectrum 选项关掉
+        // （那会把频谱画到黑边），调整中也按目标区域显示，否则调位置看不到效果。
+        if (adjusting) {
+            spectrumRenderer.setRenderInGameArea(true);
+            spectrumRenderer.setRenderMono(true);
+            spectrumRenderer.setGameArea(area[0], area[1], area[2], area[3]);
+            return;
         }
 
         // 如果 skin 没有 spectrum offset 或者 In-Game Spectrum 选项关闭，则在游戏框外（黑边区域）渲染
@@ -187,9 +146,7 @@ public class BeatorajaGame extends ApplicationAdapter {
         // skin 有 spectrum offset，在游戏内区域渲染
         spectrumRenderer.setRenderInGameArea(true);
         spectrumRenderer.setRenderMono(true);
-        //        com.badlogic.gdx.Gdx.app.log("Spectrum", "Skin has spectrum offset, inGameArea=true");
-        //        com.badlogic.gdx.Gdx.app.log("Spectrum", "Final setGameArea: x=" + specX + " y=" + specY + " w=" + specW + " h=" + specH);
-        spectrumRenderer.setGameArea(specX, specY, specW, specH);
+        spectrumRenderer.setGameArea(area[0], area[1], area[2], area[3]);
     }
 
     @Override
@@ -226,14 +183,6 @@ public class BeatorajaGame extends ApplicationAdapter {
         }
     }
 
-    private static byte[] readFile(File file) throws java.io.IOException {
-        java.io.FileInputStream fis = new java.io.FileInputStream(file);
-        byte[] data = new byte[(int) file.length()];
-        fis.read(data);
-        fis.close();
-        return data;
-    }
-
     /**
      * 获取MainController实例，供Android平台调用
      * @return MainController实例
@@ -243,13 +192,13 @@ public class BeatorajaGame extends ApplicationAdapter {
     }
 
     /**
-     * 更新频谱渲染配置（供FloatingMenu调用）
+     * 更新频谱渲染配置（供 FloatingMenu / InGameSpectrumConfig 调用）
      */
     public void updateSpectrumConfig() {
         if (controller != null) {
             Config cfg = controller.getConfig();
             if (cfg != null) {
-                configureSpectrumRenderer(cfg);
+                configureSpectrumRenderer(cfg, controller.isSpectrumAdjustOpen());
             }
         }
     }

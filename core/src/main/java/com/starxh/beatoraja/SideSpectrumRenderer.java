@@ -34,8 +34,19 @@ public class SideSpectrumRenderer {
     private float gameAreaX = 0, gameAreaY = 0, gameAreaW = 320, gameAreaH = 80;
     private boolean hasValidGameArea = false;
 
+    /**
+     * 频谱坐标所属的皮肤坐标空间（skin.header 的 w/h，GenericTheme = 1920x1080）。
+     * spectrumconfig.json / PlayerConfig 里的 x/y/w/h 都按这个空间解释。
+     */
+    private float skinSpaceW = 1920f, skinSpaceH = 1080f;
+
+    /** 主渲染当前使用的视口矩形（屏幕像素，MainController 每帧计算，含拉伸/黑边） */
+    private int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0;
+    private boolean hasViewport = false;
+
     private int lastW = -1, lastH = -1;
-    private boolean needsMatrixUpdate = true;
+    /** 上一次设置给 camera 的正交尺寸，尺寸变化才重建矩阵 */
+    private float lastOrthoW = -1, lastOrthoH = -1;
 
     public SideSpectrumRenderer() {
         shapeRenderer = new ShapeRenderer();
@@ -49,9 +60,47 @@ public class SideSpectrumRenderer {
         }
     }
 
+    /** 设置频谱配置所处的皮肤坐标空间（皮肤 header 的 w/h） */
+    public void setSkinSpace(float w, float h) {
+        if (w > 0 && h > 0) {
+            this.skinSpaceW = w;
+            this.skinSpaceH = h;
+        }
+    }
+
+    /** 设置主渲染当前的视口矩形（屏幕像素坐标，左下角原点） */
+    public void setViewportRect(int x, int y, int w, int h) {
+        if (w > 0 && h > 0) {
+            this.viewportX = x;
+            this.viewportY = y;
+            this.viewportW = w;
+            this.viewportH = h;
+            this.hasViewport = true;
+        } else {
+            this.hasViewport = false;
+        }
+    }
+
+    /**
+     * 相机正交尺寸变化时才重建投影矩阵。
+     * 旧实现只按"屏幕尺寸变化"更新，视口矩形（游戏内区域）变化时矩阵会残留成旧尺寸，
+     * 结果是 viewport 只有一小块、内容却按整屏坐标绘制 → 只剩极小一块可见。
+     */
+    private void applyCamera(float orthoW, float orthoH) {
+        if (orthoW != lastOrthoW || orthoH != lastOrthoH) {
+            camera.setToOrtho(false, orthoW, orthoH);
+            camera.update();
+            lastOrthoW = orthoW;
+            lastOrthoH = orthoH;
+        }
+        shapeRenderer.setProjectionMatrix(camera.combined);
+    }
+
     public void resize(int width, int height) {
         camera.setToOrtho(false, width, height);
         camera.update();
+        lastOrthoW = width;
+        lastOrthoH = height;
     }
 
     /**
@@ -97,7 +146,9 @@ public class SideSpectrumRenderer {
         if (w != lastW || h != lastH) {
             lastW = w;
             lastH = h;
-            needsMatrixUpdate = true;
+            // 屏幕尺寸变化后缓存的投影尺寸不再可信
+            lastOrthoW = -1;
+            lastOrthoH = -1;
         }
 
         testTimer += Gdx.graphics.getDeltaTime();
@@ -137,39 +188,48 @@ public class SideSpectrumRenderer {
         shapeRenderer.begin(ShapeRenderer.ShapeType.Filled);
 
         if (renderInGameArea && hasValidGameArea) {
-            // 计算游戏区域在屏幕上的位置（1920x1080坐标映射到实际屏幕）
-            float gameHeight = h;
-            float gameWidth = gameHeight * (1920f / 1080f);
-            float gameLeft = (w - gameWidth) / 2f;
+            // 游戏区映射：用主渲染真实的视口矩形 + 皮肤坐标空间换算，
+            // 不再假设"16:9 满高居中"、也不再写死 1920x1080 —— 皮肤可能是
+            // 1280x720 / 1920x1080，且开启拉伸全屏时视口 ≠ 等比矩形。
+            float vpX, vpY, vpW, vpH;
+            if (hasViewport) {
+                vpX = viewportX;
+                vpY = viewportY;
+                vpW = viewportW;
+                vpH = viewportH;
+            } else {
+                // 没有视口信息时回退到旧的等比假设（按皮肤宽高比、满高居中）
+                vpH = h;
+                vpW = vpH * (skinSpaceW / skinSpaceH);
+                vpX = (w - vpW) / 2f;
+                vpY = 0;
+            }
+            final float scaleX = vpW / skinSpaceW;
+            final float scaleY = vpH / skinSpaceH;
 
             // 计算spectrum区域在屏幕上的像素位置和大小
-            float specScreenX = gameLeft + (gameAreaX / 1920f) * gameWidth;
-            float specScreenW = (gameAreaW / 1920f) * gameWidth;
-            float specScreenH = (gameAreaH / 1080f) * gameHeight;
-            float specScreenY_bottom = (gameAreaY / 1080f) * gameHeight;
+            float specScreenX = vpX + gameAreaX * scaleX;
+            float specScreenW = gameAreaW * scaleX;
+            float specScreenH = gameAreaH * scaleY;
+            // 配置里的 y 与 JSON/Lua 皮肤自身的 dst 约定一致：从底部起算（Skin.setDestination
+            // 对 dst 只做 y * dh，不翻转；LR2 皮肤在 loader 里已换算过），
+            // 所以这里直接作为 GL 视口的左下角 y。
+            float specScreenY_bottom = vpY + gameAreaY * scaleY;
 
-            // 设置viewport和camera只覆盖spectrum区域
-            Gdx.gl.glViewport((int) specScreenX, (int) specScreenY_bottom, (int) specScreenW, (int) specScreenH);
-            if (needsMatrixUpdate) {
-                camera.setToOrtho(false, (int) specScreenW, (int) specScreenH);
-                camera.update();
-                needsMatrixUpdate = false;
-            }
-            shapeRenderer.setProjectionMatrix(camera.combined);
-            if (mode == MODE_WAVEFORM) {
-                renderWaveformInGameArea(spectrum, hasRealData, specScreenW, specScreenH);
-            } else {
-                renderInGameArea(spectrum, topValues, hasRealData, specScreenW, specScreenH);
+            if (specScreenW >= 1 && specScreenH >= 1) {
+                // 设置viewport和camera只覆盖spectrum区域
+                Gdx.gl.glViewport((int) specScreenX, (int) specScreenY_bottom, (int) specScreenW, (int) specScreenH);
+                applyCamera(specScreenW, specScreenH);
+                if (mode == MODE_WAVEFORM) {
+                    renderWaveformInGameArea(spectrum, hasRealData, specScreenW, specScreenH);
+                } else {
+                    renderInGameArea(spectrum, topValues, hasRealData, specScreenW, specScreenH);
+                }
             }
         } else {
             // 黑边区域渲染模式 - 使用屏幕坐标
             Gdx.gl.glViewport(0, 0, w, h);
-            if (needsMatrixUpdate) {
-                camera.setToOrtho(false, w, h);
-                camera.update();
-                needsMatrixUpdate = false;
-            }
-            shapeRenderer.setProjectionMatrix(camera.combined);
+            applyCamera(w, h);
             if (mode == MODE_WAVEFORM) {
                 renderWaveformInBlackBars(spectrum, w, h, hasRealData);
             } else {

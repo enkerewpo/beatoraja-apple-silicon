@@ -11,6 +11,7 @@ import java.util.logging.Logger;
 import com.badlogic.gdx.utils.Array;
 import com.badlogic.gdx.utils.FloatArray;
 import com.badlogic.gdx.Gdx;
+import com.badlogic.gdx.math.Rectangle;
 
 import bms.model.*;
 import bms.player.beatoraja.*;
@@ -1189,6 +1190,39 @@ public class BMSPlayer extends MainState {
 
 	public PracticeConfiguration getPracticeConfiguration() {
 		return practice;
+	}
+
+	/** 叠加层用的一次性矩形（避免每帧分配） */
+	private final Rectangle practiceOverlayRect = new Rectangle();
+
+	/**
+	 * 练习模式参数面板的叠加绘制，由 MainController 在皮肤全部绘制完成之后调用。
+	 *
+	 * <p>只对触摸版皮肤生效（{@link PracticeConfiguration#isOverlayOnTop}）：它的轨道背景是
+	 * 一整块不透明矩形，面板画在 BGA 层会被整块盖住。其他皮肤仍按上游做法由
+	 * {@link SkinBGA} 画在 BGA 层（在轨道/notes 之下）。</p>
+	 *
+	 * <p>区域取整个皮肤范围：触摸版皮肤的 BGA 层本来也是铺满全屏的
+	 * （portrait 分支与 landscape 分支都是 0,0,header.w,header.h），所以位置一致。</p>
+	 */
+	public void drawPracticeOverlay(Skin.SkinObjectRenderer sprite) {
+		if (resource == null || resource.getPlayMode() == null
+				|| resource.getPlayMode().mode != BMSPlayerMode.Mode.PRACTICE) {
+			return;
+		}
+		// 只在练习配置与演奏过程中叠加。失败 / 通关 / 练习结束后的收尾动画期间不画：
+		// 面板画在皮肤之上，会盖住 stage failed、stage clear 这些收尾动画
+		// （其他皮肤的面板在 BGA 层，天然会被收尾层盖住，所以只有这里的叠加层需要门控）。
+		if (state == STATE_FAILED || state == STATE_FINISHED || state == STATE_PRACTICE_FINISHED) {
+			return;
+		}
+		final Skin skin = getSkin();
+		if (!practice.isOverlayOnTop(skin)) {
+			return;
+		}
+		practiceOverlayRect.set(0, 0,
+				skin != null ? skin.getWidth() : 1920, skin != null ? skin.getHeight() : 1080);
+		practice.draw(practiceOverlayRect, sprite, timer.getNowTime(), this);
 	}
 
 	public int getJudgeCount(int judge, boolean fast) {

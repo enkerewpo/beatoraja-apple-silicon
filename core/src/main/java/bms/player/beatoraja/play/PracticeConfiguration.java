@@ -13,11 +13,14 @@ import bms.player.beatoraja.MainState;
 import bms.player.beatoraja.input.BMSPlayerInputProcessor;
 import bms.player.beatoraja.input.KeyBoardInputProcesseor.ControlKeys;
 import bms.player.beatoraja.skin.SkinNoteDistributionGraph;
+import bms.player.beatoraja.skin.Skin;
+import bms.player.beatoraja.skin.SkinHeader;
 import bms.player.beatoraja.skin.Skin.SkinObjectRenderer;
 
 import com.badlogic.gdx.Gdx;
 import com.badlogic.gdx.graphics.Color;
 import com.badlogic.gdx.graphics.g2d.BitmapFont;
+import com.badlogic.gdx.graphics.g2d.GlyphLayout;
 import com.badlogic.gdx.graphics.g2d.freetype.FreeTypeFontGenerator;
 import com.badlogic.gdx.graphics.g2d.freetype.FreeTypeFontGenerator.FreeTypeFontParameter;
 import com.badlogic.gdx.math.MathUtils;
@@ -144,27 +147,137 @@ public final class PracticeConfiguration {
 	}
 
 	public void draw(Rectangle r, SkinObjectRenderer sprite, long time, MainState state) {
+		updateLayoutMode(state.getSkin());
 		float x = r.x + r.width / 8;
 		float y = r.y + r.height * 7 / 8;
+		if (textAngle != 0f) {
+			// 竖屏：整块文字跟着转 270°。旋转后"换行方向"变成皮肤 -x
+			// （皮肤坐标 x = 设备水平方向，note 也是沿 x 下落的），
+			// 所以锚点就是文字块的最右侧 —— 取到靠近右边缘，左边留出 13 行行宽。
+			x = r.x + r.width - 40;
+		}
 		if(titlefont != null) {
 			for(int i = 0;i < elements.length;i++) {
 				if(elements[i].predicate.test(this)) {
-					sprite.draw(titlefont, elements[i].text.apply(property), x, y - 22 * i, cursorpos == i ? Color.YELLOW : Color.CYAN);
+					drawText(sprite, elements[i].text.apply(property), x, y, 0, 22 * i,
+							cursorpos == i ? Color.YELLOW : Color.CYAN);
 				}
 			}
 
 			if (state.resource.mediaLoadFinished()) {
-				sprite.draw(titlefont, "PRESS 1KEY TO PLAY", x, y - 276, Color.ORANGE);
+				drawText(sprite, "PRESS 1KEY TO PLAY", x, y, 0, 276, Color.ORANGE);
 			}
-			
+
 			String[] judge = {"PGREAT :","GREAT  :","GOOD   :", "BAD    :", "POOR   :", "KPOOR  :"};
 			for(int i = 0; i < 6; i++) {
-				sprite.draw(titlefont, String.format("%s %d %d %d",judge[i], state.getJudgeCount(i, true) + state.getJudgeCount(i, false), state.getJudgeCount(i, true), state.getJudgeCount(i, false)), x + 250, y - (i * 22), Color.WHITE);
-			}			
+				drawText(sprite, String.format("%s %d %d %d",judge[i], state.getJudgeCount(i, true) + state.getJudgeCount(i, false), state.getJudgeCount(i, true), state.getJudgeCount(i, false)),
+						x, y, 250, i * 22, Color.WHITE);
+			}
 		}
 
-		graph[property.graphtype].draw(sprite, time, state, new Rectangle(r.x, r.y, r.width, r.height / 4), property.starttime,
-				property.endtime, property.freq / 100f);
+		// 触摸版皮肤不画 note 密度图：它会整块压在轨道上，而参数文字已经够用
+		if (drawGraph) {
+			graph[property.graphtype].draw(sprite, time, state, new Rectangle(r.x, r.y, r.width, r.height / 4), property.starttime,
+					property.endtime, property.freq / 100f);
+		}
+	}
+
+	// ─────────────────── 呈现方式（按皮肤决定）───────────────────
+
+	/** 判定结果对应的皮肤，避免每帧重复解析皮肤选项 */
+	private Skin layoutSkin;
+	/** 触摸版皮肤（GenericTheme for Touchscreen 等）：叠加在最上层 + 半透明 + 不画密度图 */
+	private boolean touchScreen;
+	/** 文字透明度：触摸皮肤 0.3，其他皮肤 1 */
+	private float textAlpha = 1f;
+	/** 是否绘制 note 分布图 */
+	private boolean drawGraph = true;
+	/** 文字旋转角（度）：0 = 不旋转，270 = 竖屏 */
+	private float textAngle = 0f;
+	private final GlyphLayout textLayout = new GlyphLayout();
+	private final Color tempColor = new Color();
+
+	/**
+	 * 面板是否必须画在皮肤<b>之后</b>（屏幕最上层），而不是待在 BGA 层里。
+	 *
+	 * <p>触摸版皮肤的轨道背景是一整块<b>不透明</b>矩形（竖屏时铺满全屏），
+	 * 参数面板画在 BGA 层会被它整块盖住 —— 这就是"练习模式看不到参数调整"的原因。
+	 * 配合 30% 透明度与去掉密度图，叠加在最上层也不会太挡 note。</p>
+	 */
+	public boolean isOverlayOnTop(Skin skin) {
+		updateLayoutMode(skin);
+		return touchScreen;
+	}
+
+	private void updateLayoutMode(Skin skin) {
+		if (skin == layoutSkin) {
+			return;
+		}
+		layoutSkin = skin;
+		touchScreen = isTouchscreenSkin(skin);
+		textAlpha = touchScreen ? 0.3f : 1f;
+		drawGraph = !touchScreen;
+		textAngle = touchScreen && isPortraitLayout(skin) ? 270f : 0f;
+	}
+
+	/** 皮肤名里带 Touchscreen 的按触摸版处理 */
+	private static boolean isTouchscreenSkin(Skin skin) {
+		if (skin == null || skin.header == null || skin.header.getName() == null) {
+			return false;
+		}
+		return skin.header.getName().toLowerCase().contains("touchscreen");
+	}
+
+	/** 皮肤自己的 Layout 选项选了 Portrait → 画面相对设备旋转了 270° */
+	private static boolean isPortraitLayout(Skin skin) {
+		if (skin == null || skin.header == null) {
+			return false;
+		}
+		SkinHeader.CustomOption[] options = skin.header.getCustomOptions();
+		if (options == null) {
+			return false;
+		}
+		for (SkinHeader.CustomOption option : options) {
+			if (option == null || !"layout".equalsIgnoreCase(option.name) || option.contents == null) {
+				continue;
+			}
+			for (int i = 0; i < option.contents.length && i < option.option.length; i++) {
+				if ("portrait".equalsIgnoreCase(option.contents[i])) {
+					return option.option[i] == option.getSelectedOption();
+				}
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * 绘制一段文字。{(u, v)} 是未旋转时的"阅读方向 / 换行方向"偏移量，
+	 * 会按 {@link #textAngle} 一起旋转，所以旋转后行列关系仍然正确。
+	 */
+	private void drawText(SkinObjectRenderer sprite, String text, float ox, float oy, float u, float v, Color color) {
+		final Color c = tint(color);
+		if (textAngle == 0f) {
+			sprite.draw(titlefont, text, ox + u, oy - v, c);
+			return;
+		}
+		final double rad = Math.toRadians(textAngle);
+		final float cr = (float) Math.cos(rad);
+		final float sr = (float) Math.sin(rad);
+		// 阅读方向 (1,0) → (cr, sr)；换行方向 (0,-1) → (sr, -cr)
+		final float px = ox + u * cr + v * sr;
+		final float py = oy + u * sr - v * cr;
+		// 旋转重载本身不设置颜色，颜色取自 font：先设色再排版（GlyphLayout 在 setText 时取色）
+		titlefont.setColor(c);
+		textLayout.setText(titlefont, text);
+		sprite.draw(titlefont, textLayout, px, py, px, py, textAngle);
+	}
+
+	/** 按 textAlpha 调暗（触摸皮肤用 50% 透明） */
+	private Color tint(Color base) {
+		if (textAlpha >= 1f) {
+			return base;
+		}
+		return tempColor.set(base.r, base.g, base.b, base.a * textAlpha);
 	}
 	
 	public void dispose() {

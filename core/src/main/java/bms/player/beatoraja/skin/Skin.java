@@ -246,6 +246,14 @@ public class Skin {
 	private long nextpreparetime;
 	private long prepareduration;
 
+	/**
+	 * 皮肤自己的渲染器（首次 {@link #drawAllObjects} 时创建）。
+	 * 供"必须画在皮肤之上"的叠加层复用，以保证视口、变换矩阵、纹理过滤设置完全一致。
+	 */
+	public SkinObjectRenderer getObjectRenderer() {
+		return renderer;
+	}
+
 	public void drawAllObjects(SpriteBatch sprite, MainState state) {
 		if(renderer == null) {
 			SkinOffset offsetAll = getOffsetAll(state);

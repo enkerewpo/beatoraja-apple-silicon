@@ -9,9 +9,12 @@ import com.badlogic.gdx.graphics.g2d.GlyphLayout;
 import com.badlogic.gdx.graphics.g2d.SpriteBatch;
 import com.badlogic.gdx.math.Matrix4;
 
+import java.util.ArrayList;
+
 import bms.player.beatoraja.input.KeyBoardInputProcesseor;
 import bms.player.beatoraja.input.BMSPlayerInputProcessor;
 import bms.player.beatoraja.rating.PlayerRatingService;
+import com.starxh.beatoraja.InGameSpectrumConfig;
 
 /**
  * Android 用浮动快捷键菜单。
@@ -40,8 +43,6 @@ public class FloatingMenu implements InputProcessor {
     private static final float BTN_H = 80;               // 缩小 30%
     private static final float BTN_GAP = 10;             // 缩小 30%
     private static final float PANEL_PAD = 24;           // 缩小 30%
-    /** 频谱调整页开始的按钮索引（0-based） */
-    private static final int SPECTRUM_START = 15;
 
     private boolean expanded = false;
     private boolean visible = true;                     // PLAY 状态时隐藏
@@ -56,16 +57,40 @@ public class FloatingMenu implements InputProcessor {
     /** Play 模式时：图标是否因超时被隐藏（点击图标区域可重新显示） */
     private boolean playIconHidden = false;
 
-    // ─── 频谱编辑模式 ───
-    private int editingField = -1; // -1=none, 0=X, 1=Y, 2=W, 3=H
-    private int editValue = 0; // 当前编辑值
-    private int adjustDelta = 1; // 调整粒度：X/Y用1pixel，W/H用10
-    /** 长按调整定时器（纳秒） */
-    private long adjustStartTime = 0;
-    private static final long ADJUST_INITIAL_DELAY = 300000000L; // 300ms开始
-    private static final long ADJUST_ACCEL_INTERVAL = 300000000L; // 每300ms加速
-    private int adjustDirection = 0; // -1=递减, +1=递增
-    private boolean shortPressCommitted = false; // 短按已在render中触发，release时不再重复提交
+    // ─── In-Game Spectrum 调整页（独立模态页，不参与通用分页）───
+    /**
+     * 调整页是否打开。<b>仅 PLAY 界面可进入</b>：入口项 keycode 为
+     * {@link #SPECTRUM_ENTRY_KEYCODE}，被 {@link #isItemVisible} 限制为只有
+     * isPlayMode 时才出现；离开 PLAY（setPlayMode(false)）时强制收起，
+     * 避免面板残留在结果等界面。
+     */
+    private boolean spectrumAdjustOpen = false;
+    /** 当前编辑的四个值 X/Y/W/H（进入页面时从"生效值"载入，编辑期间以这份为准） */
+    private final int[] spectrumValues = new int[4];
+    /** 正在长按的字段（-1 = 没有）与方向（-1 / +1） */
+    private int spectrumHoldField = -1;
+    private int spectrumHoldDir = 0;
+    private long spectrumHoldStartNs = 0;
+    private long spectrumHoldLastRepeatNs = 0;
+    private static final long SPECTRUM_HOLD_DELAY_NS = 300_000_000L;   // 按住 300ms 后开始连发
+    private static final long SPECTRUM_HOLD_REPEAT_NS = 60_000_000L;   // 连发间隔
+    private static final long SPECTRUM_HOLD_ACCEL_NS = 400_000_000L;   // 每 400ms 加速一倍
+    private static final int SPECTRUM_HOLD_MAX_MULT = 64;
+    /** In-Game Spectrum 调整页入口项的 keycode（isItemVisible 用它做"仅 PLAY"判定） */
+    private static final int SPECTRUM_ENTRY_KEYCODE = -135;
+    /** Walkure（玩家实力表）按钮的 keycode —— 也作为 Show FPS 在 PLAY 界面的占位锚点 */
+    private static final int WALKURE_KEYCODE = -140;
+    /** 每个指针当前按下的频谱单元格编码（row*10+col，-1 = 无），仅用于按下高亮 */
+    private final int[] pointerSpectrumCell = new int[20];
+
+    // ─── 频谱调整页布局常量 ───
+    private static final int SPECTRUM_COLS = 3;      // 值 / [-] / [+]
+    private static final int SPECTRUM_ROWS = 4;      // X / Y / W / H
+    private static final float SPECTRUM_TITLE_H = 44;
+    /** 编码：row*10 + col，col: 0=值 1=[-] 2=[+]；特殊值见 SPECTRUM_HIT_* */
+    private static final int SPECTRUM_HIT_NONE = -1;    // 面板内但没点到按钮
+    private static final int SPECTRUM_HIT_OUTSIDE = -2; // 面板外
+    private static final int SPECTRUM_HIT_BACK = -3;    // 标题栏返回
 
     // ─── 分页 ───
     private static final int ITEMS_PER_PAGE = 12;  // 每页12个：2列×6行普通，或3列×4行频谱调整页
@@ -78,6 +103,8 @@ public class FloatingMenu implements InputProcessor {
 
     // ─── 按钮定义 ───
     private static class MenuItem {
+        /** playInsertBefore 的默认值：不在 PLAY 界面改变顺序 */
+        static final int NO_PLAY_ORDER = Integer.MIN_VALUE;
         String label;
         final int keycode;
         final boolean isToggle;
@@ -85,6 +112,12 @@ public class FloatingMenu implements InputProcessor {
         final boolean showOnKeyConfig;    // 是否在 KeyConfig 界面显示
         final boolean showOnPlay;         // 是否在 Play 界面显示
         final boolean showOnSkinSelect;   // 是否在 SkinSelect 界面显示（默认 false，避免误显示）
+        /**
+         * 仅 PLAY 界面的顺序覆盖：填某个 keycode 时，本项在 PLAY 界面被插到该项之前；
+         * 其他界面一律保持 {@link #items} 数组里的原顺序。
+         * 用于"某按钮在选曲界面位置不变、但在 PLAY 界面要挪到别处"这类需求。
+         */
+        final int playInsertBefore;
         MenuItem(String label, int keycode) { this(label, keycode, false, true, true, true, false); }
         MenuItem(String label, int keycode, boolean isToggle) { this(label, keycode, isToggle, true, true, true, false); }
         MenuItem(String label, int keycode, boolean isToggle, boolean showOnSelect) { this(label, keycode, isToggle, showOnSelect, true, true, false); }
@@ -93,19 +126,24 @@ public class FloatingMenu implements InputProcessor {
             this(label, keycode, isToggle, showOnSelect, showOnKeyConfig, showOnPlay, false);
         }
         MenuItem(String label, int keycode, boolean isToggle, boolean showOnSelect, boolean showOnKeyConfig, boolean showOnPlay, boolean showOnSkinSelect) {
+            this(label, keycode, isToggle, showOnSelect, showOnKeyConfig, showOnPlay, showOnSkinSelect, NO_PLAY_ORDER);
+        }
+        MenuItem(String label, int keycode, boolean isToggle, boolean showOnSelect, boolean showOnKeyConfig, boolean showOnPlay, boolean showOnSkinSelect, int playInsertBefore) {
             this.label = label; this.keycode = keycode; this.isToggle = isToggle;
             this.showOnSelect = showOnSelect; this.showOnKeyConfig = showOnKeyConfig;
             this.showOnPlay = showOnPlay; this.showOnSkinSelect = showOnSkinSelect;
+            this.playInsertBefore = playInsertBefore;
         }
     }
 
-    // 频谱调整：-111~114=X/Y/W/H选择器, -121~122=X+/- -123~124=Y+/- -125~126=W+/- -127~128=H+/-
-    // 结构：6个通用 + 13个频谱调整（独占1页）+ 2个Controller Reset
+    // 频谱调整：In-Game Spectrum 入口(-135) 打开独立模态页（drawSpectrumPage /
+    // hitTestSpectrumPage），页内按钮不与通用分页列表共享索引空间。
     private final MenuItem[] items = {
         // ── 通用按钮（第1页）───────────────────────
         // 构造参数: (label, keycode, isToggle, showOnSelect, showOnKeyConfig, showOnPlay, showOnSkinSelect)
         new MenuItem("Touch Key: ON",  -100, true,  true, false, true, false),
-        new MenuItem("Walkure",       -140, false, true, false, true, false),
+        // Walkure 在 PLAY 界面隐藏：那一格由 Show FPS 占用（见其 playInsertBefore）。
+        new MenuItem("Walkure",   WALKURE_KEYCODE, false, true, false, false, false),
         new MenuItem("Update Song",   Keys.F2, false, true, false, true, false),
         new MenuItem("Music Player",   -130, false, true, false, true, false),
         new MenuItem("Skin Select",   Keys.F12, false, true, false, true, false),
@@ -118,26 +156,18 @@ public class FloatingMenu implements InputProcessor {
         new MenuItem("^ UP",        Keys.UP, false, true, true, true, true),
         new MenuItem("v DOWN",      Keys.DOWN, false, true, true, true, true),
         new MenuItem("< LEFT",      Keys.LEFT, false, true, true, true, true),
-        new MenuItem("> RIGHT",     Keys.RIGHT, false, false, true, false, true),
-        new MenuItem("Show FPS",      Keys.F1, false, true, false, true, false),
+        new MenuItem("> RIGHT",     Keys.RIGHT, false, false, true, true, true),
+        // Show FPS：数组里排在末尾（选曲等界面维持原位置不变）；
+        // PLAY 界面用 playInsertBefore 占用 Walkure 那一格（Walkure 在 PLAY 已隐藏）。
+        new MenuItem("Show FPS",      Keys.F1, false, true, false, true, false, WALKURE_KEYCODE),
+        // ── In-Game Spectrum 调整入口（仅 PLAY 界面；见 isItemVisible）──
+        // 调整界面是独立模态页（3列×4行，见 drawSpectrumPage/hitTestSpectrumPage），
+        // 不再把 12 个 +/- 按钮塞进通用分页列表 —— 那套做法混用了"可见项索引"与
+        // "数组索引"，导致列错位、按 Y 的 ± 会把 X 的 + 覆盖掉。
+        // showOnSelect=false + isItemVisible 的"仅 PLAY"硬规则共同把它限制在游玩界面。
+        new MenuItem("In-Game Spectrum", SPECTRUM_ENTRY_KEYCODE, false, false, false, true, false),
 
-
-        // ── 频谱调整（第2页，12项，独立使用3列布局）─────
-        // showOnKeyConfig=false：频谱调整仅在 Select/Play 界面显示
-        new MenuItem("X: 0", -111, false, true, false, true, false),
-        new MenuItem("[-]", -121, false, true, false, true, false),
-        new MenuItem("[+]", -122, false, true, false, true, false),
-        new MenuItem("Y: 0", -112, false, true, false, true, false),
-        new MenuItem("[-]", -123, false, true, false, true, false),
-        new MenuItem("[+]", -124, false, true, false, true, false),
-        new MenuItem("W: 0", -113, false, true, false, true, false),
-        new MenuItem("[-]", -125, false, true, false, true, false),
-        new MenuItem("[+]", -126, false, true, false, true, false),
-        new MenuItem("H: 0", -114, false, true, false, true, false),
-        new MenuItem("[-]", -127, false, true, false, true, false),
-        new MenuItem("[+]", -128, false, true, false, true, false),
-
-        // ── Controller Reset（第3页，仅KeyConfig模式）──
+        // ── Controller Reset（仅KeyConfig模式）──
         new MenuItem("NUM 8", Keys.NUM_8, false, false, true, false, false),
         new MenuItem("NUM 2", Keys.NUM_2, false, false, true, false, false),
         new MenuItem("DELETE", Keys.FORWARD_DEL, false, false, true, false, false),
@@ -283,6 +313,10 @@ public class FloatingMenu implements InputProcessor {
         if (playMode) {
             sinceLastInteraction = 0f;
             playIconHidden = false;
+        } else if (spectrumAdjustOpen) {
+            // 离开 PLAY（进结果、回选曲等）时强制收起调整页并落盘，
+            // 否则模态页会残留在其他界面。MainController 只在状态切换时调用本方法。
+            exitSpectrumAdjust();
         }
     }
 
@@ -292,7 +326,48 @@ public class FloatingMenu implements InputProcessor {
         if (keyConfigMode && !item.showOnKeyConfig) return false;
         if (skinSelectMode && !item.showOnSkinSelect) return false;
         if (isPlayMode && !item.showOnPlay) return false;
+        // In-Game Spectrum 调整入口：只在 PLAY 界面出现。
+        // 上面四条是"某模式生效时要求对应标记"，未设置任何模式的状态（RESULT 等）
+        // 会全部放行，所以"仅 PLAY"必须是一条独立硬规则。
+        if (item.keycode == SPECTRUM_ENTRY_KEYCODE && !isPlayMode) return false;
         return true;
+    }
+
+    /**
+     * 组装当前界面"可见按钮"的原始索引序列。
+     *
+     * <p>顺序 = {@link #items} 数组顺序；仅 PLAY 界面额外应用
+     * {@link MenuItem#playInsertBefore} 的顺序覆盖：声明该项的按钮<b>占用锚点项的位置</b>，
+     * 这样"选曲等界面位置不变、PLAY 界面换个位置"的需求不必改数组顺序。</p>
+     *
+     * <p>锚点项本身在 PLAY 界面被隐藏时，它的<b>位置依然有效</b>
+     * （例：Show FPS 占用已隐藏的 Walkure 那一格）。</p>
+     *
+     * <p>绘制（drawPanel）与命中判定（hitTestPanel）<b>必须</b>共用本方法，
+     * 否则会出现"看到的按钮"和"点到的按钮"不一致。</p>
+     */
+    private int[] buildVisibleIndexOrder() {
+        ArrayList<Integer> order = new ArrayList<>();
+        for (int i = 0; i < items.length; i++) {
+            MenuItem item = items[i];
+            if (isPlayMode) {
+                // 走到锚点位置：先把声明"占用这个位置"的可见项放进来。
+                // 放在可见性判定之前，所以锚点自身被隐藏时其位置仍然可用。
+                for (int k = 0; k < items.length; k++) {
+                    if (items[k].playInsertBefore == item.keycode && isItemVisible(items[k])) {
+                        order.add(k);
+                    }
+                }
+                // 带顺序覆盖的项不在数组原位出现（已由锚点位置插入）
+                if (item.playInsertBefore != MenuItem.NO_PLAY_ORDER) continue;
+            }
+            if (!isItemVisible(item)) continue;
+            order.add(i);
+        }
+
+        int[] res = new int[order.size()];
+        for (int j = 0; j < res.length; j++) res[j] = order.get(j);
+        return res;
     }
 
     // ─────────────────── 纹理创建 ───────────────────
@@ -376,24 +451,24 @@ public class FloatingMenu implements InputProcessor {
             }
         }
 
-        // 长按调整：300ms后开始，每300ms加速（1→2→5→10→20...）
-        if (adjustStartTime > 0 && adjustDirection != 0) {
-            long elapsed = System.nanoTime() - adjustStartTime;
-            if (elapsed >= ADJUST_INITIAL_DELAY) {
-                // 计算加速倍数：每300ms加速一次
-                long accels = (elapsed - ADJUST_INITIAL_DELAY) / ADJUST_ACCEL_INTERVAL;
-                int multiplier = 1;
-                for (long i = 0; i < accels && multiplier < 100; i++) {
-                    multiplier = Math.min(multiplier * 2, 100);
+        // 频谱调整页：长按 [-] / [+] 连发（300ms 后开始，每 60ms 一次，按住越久步长越大）
+        if (spectrumAdjustOpen && spectrumHoldField >= 0 && spectrumHoldDir != 0) {
+            long now = System.nanoTime();
+            long elapsed = now - spectrumHoldStartNs;
+            if (elapsed >= SPECTRUM_HOLD_DELAY_NS
+                    && now - spectrumHoldLastRepeatNs >= SPECTRUM_HOLD_REPEAT_NS) {
+                spectrumHoldLastRepeatNs = now;
+                long accelSteps = (elapsed - SPECTRUM_HOLD_DELAY_NS) / SPECTRUM_HOLD_ACCEL_NS;
+                int mult = 1;
+                for (long i = 0; i < accelSteps && mult < SPECTRUM_HOLD_MAX_MULT; i++) {
+                    mult = Math.min(mult * 2, SPECTRUM_HOLD_MAX_MULT);
                 }
-                editValue += adjustDirection * adjustDelta * multiplier;
-                updateFieldLabel(editingField, editValue);
-            } else if (elapsed >= 0 && !shortPressCommitted) {
-                // 短按：不足300ms就松开，执行1次调整
-                editValue += adjustDirection * adjustDelta;
-                updateFieldLabel(editingField, editValue);
-                shortPressCommitted = true;
+                spectrumStep(spectrumHoldField, spectrumHoldDir * mult);
             }
+        }
+        // 指针异常丢失（切后台等）：停掉连发，避免一直改值
+        if (spectrumHoldField >= 0 && !Gdx.input.isTouched()) {
+            stopSpectrumHold(true);
         }
 
         // ─── 设置投影矩阵到逻辑坐标 ───
@@ -427,6 +502,12 @@ public class FloatingMenu implements InputProcessor {
     }
 
     private void drawPanel(SpriteBatch sprite, BitmapFont font) {
+        // 0. 频谱调整页是独立模态页（自己的布局与命中判定），不参与通用分页列表
+        if (spectrumAdjustOpen) {
+            drawSpectrumPage(sprite, font);
+            return;
+        }
+
         // 1. 获取基础布局参数
         PanelLayout info = calculatePanelLayout();
 
@@ -442,16 +523,8 @@ public class FloatingMenu implements InputProcessor {
         sprite.draw(whitePixel, info.x, info.y, border, info.h);
         sprite.draw(whitePixel, info.x + info.w - border, info.y, border, info.h);
 
-        // 收集可见按钮索引
-        int visibleCount = 0;
-        for (MenuItem item : items) { if (isItemVisible(item)) visibleCount++; }
-        int[] visibleIndices = new int[visibleCount];
-        int idx = 0;
-        for (int i = 0; i < items.length; i++) {
-            if (isItemVisible(items[i])) {
-                visibleIndices[idx++] = i;
-            }
-        }
+        // 收集可见按钮索引（含 PLAY 界面的顺序覆盖；绘制与命中判定同一份顺序）
+        int[] visibleIndices = buildVisibleIndexOrder();
 
         // GlyphLayout 在翻页和按钮中都要用
         GlyphLayout glyph = new GlyphLayout();
@@ -476,13 +549,8 @@ public class FloatingMenu implements InputProcessor {
                 float arrowX = info.x + info.w - PANEL_PAD - glyph.width;
                 font.draw(sprite, rightArrow, arrowX, pageY + info.pageBarHeight - 8);
             }
-            // 页码：频谱调整页显示"Spectrum"，其他页显示"页码"
-            String pageText;
-            if (info.isSpectrumPage) {
-                pageText = "In-Game Spectrum Adjust";
-            } else {
-                pageText = (currentPage + 1) + "/" + info.totalPages;
-            }
+            // 页码
+            String pageText = (currentPage + 1) + "/" + info.totalPages;
             font.setColor(0.7f, 0.7f, 0.7f, 0.9f);
             glyph.setText(font, pageText);
             float pageTextX = info.x + (info.w - glyph.width) / 2;
@@ -538,6 +606,161 @@ public class FloatingMenu implements InputProcessor {
             }
         }
         return false;
+    }
+
+    // ─────────────────── In-Game Spectrum 调整页 ───────────────────
+
+    /** 调整页是否打开（渲染层用它决定是否在其他界面也预览频谱） */
+    public boolean isSpectrumAdjustOpen() {
+        return spectrumAdjustOpen;
+    }
+
+    private MainController mainControllerOrNull() {
+        if (kbInput == null) return null;
+        Object mc = kbInput.getMainController();
+        return (mc instanceof MainController) ? (MainController) mc : null;
+    }
+
+    /**
+     * 进入调整页：把<b>当前生效</b>的值载入编辑状态。
+     * 关键：把生效值物化进 PlayerConfig —— PlayerConfig 里 0 表示"未设置"（回退到
+     * 皮肤 json），若不在进入时落定，界面会一直显示 0 且加减后语义混乱。
+     */
+    private void enterSpectrumAdjust() {
+        MainController mc = mainControllerOrNull();
+        if (mc != null) {
+            int[] v = InGameSpectrumConfig.resolve(mc);
+            System.arraycopy(v, 0, spectrumValues, 0, 4);
+            InGameSpectrumConfig.apply(mc, v[0], v[1], v[2], v[3]);
+            InGameSpectrumConfig.save(mc);
+        }
+        spectrumAdjustOpen = true;
+        stopSpectrumHold(false);
+    }
+
+    /** 离开调整页：停止连发并落盘 */
+    private void exitSpectrumAdjust() {
+        spectrumAdjustOpen = false;
+        stopSpectrumHold(true);
+    }
+
+    /** 单步调整：X/Y 步长 1，W/H 步长 10；改完立即应用到渲染器（不落盘，退出时统一保存） */
+    private void spectrumStep(int field, int steps) {
+        if (field < 0 || field >= 4 || steps == 0) return;
+        int delta = (field >= 2) ? 10 : 1;
+        spectrumValues[field] += delta * steps;
+        MainController mc = mainControllerOrNull();
+        if (mc != null) {
+            InGameSpectrumConfig.apply(mc, spectrumValues[0], spectrumValues[1],
+                    spectrumValues[2], spectrumValues[3]);
+        }
+    }
+
+    private void stopSpectrumHold(boolean save) {
+        if (spectrumHoldField >= 0 && save) {
+            MainController mc = mainControllerOrNull();
+            if (mc != null) {
+                InGameSpectrumConfig.save(mc);
+            }
+        }
+        spectrumHoldField = -1;
+        spectrumHoldDir = 0;
+        spectrumHoldStartNs = 0;
+        spectrumHoldLastRepeatNs = 0;
+    }
+
+    /**
+     * 调整页命中判定。返回：SPECTRUM_HIT_BACK / SPECTRUM_HIT_OUTSIDE /
+     * SPECTRUM_HIT_NONE（面板内空白）/ 或 row*10+col（col: 0 值, 1 [-], 2 [+]）。
+     */
+    private int hitTestSpectrumPage(float tx, float ty) {
+        PanelLayout info = calculateSpectrumPanelLayout();
+        if (tx < info.x || tx > info.x + info.w || ty < info.y || ty > info.y + info.h) {
+            return SPECTRUM_HIT_OUTSIDE;
+        }
+        float[] r = new float[4];
+        spectrumBackRect(info, r);
+        if (tx >= r[0] && tx <= r[0] + r[2] && ty >= r[1] && ty <= r[1] + r[3]) {
+            return SPECTRUM_HIT_BACK;
+        }
+        for (int row = 0; row < SPECTRUM_ROWS; row++) {
+            for (int col = 0; col < SPECTRUM_COLS; col++) {
+                spectrumCellRect(info, row, col, r);
+                if (tx >= r[0] && tx <= r[0] + r[2] && ty >= r[1] && ty <= r[1] + r[3]) {
+                    return row * 10 + col;
+                }
+            }
+        }
+        return SPECTRUM_HIT_NONE;
+    }
+
+    private void drawSpectrumPage(SpriteBatch sprite, BitmapFont font) {
+        final float border = 2;
+        PanelLayout info = calculateSpectrumPanelLayout();
+        float[] r = new float[4];
+        GlyphLayout glyph = new GlyphLayout();
+
+        // 面板背景 + 边框
+        sprite.setColor(0.1f, 0.1f, 0.15f, 0.85f);
+        sprite.draw(whitePixel, info.x, info.y, info.w, info.h);
+        sprite.setColor(0.4f, 0.6f, 1f, 0.6f);
+        sprite.draw(whitePixel, info.x, info.y, info.w, border);
+        sprite.draw(whitePixel, info.x, info.y + info.h - border, info.w, border);
+        sprite.draw(whitePixel, info.x, info.y, border, info.h);
+        sprite.draw(whitePixel, info.x + info.w - border, info.y, border, info.h);
+
+        // 标题栏：左侧返回 + 居中标题
+        spectrumBackRect(info, r);
+        sprite.setColor(0.2f, 0.25f, 0.4f, 0.9f);
+        sprite.draw(whitePixel, r[0], r[1], r[2], r[3]);
+        font.setColor(0.6f, 0.85f, 1f, 0.95f);
+        glyph.setText(font, "<");
+        font.draw(sprite, "<", r[0] + (r[2] - glyph.width) / 2, r[1] + (r[3] + glyph.height) / 2);
+
+        String title = "In-Game Spectrum Adjust";
+        font.setColor(0.85f, 0.85f, 0.9f, 0.95f);
+        glyph.setText(font, title);
+        float barY = info.y + info.h - PANEL_PAD - SPECTRUM_TITLE_H;
+        font.draw(sprite, title, info.x + (info.w - glyph.width) / 2,
+                barY + (SPECTRUM_TITLE_H + glyph.height) / 2);
+
+        // 4 行 × 3 列：值 / [-] / [+]
+        final String[] fieldNames = { "X", "Y", "W", "H" };
+        for (int row = 0; row < SPECTRUM_ROWS; row++) {
+            for (int col = 0; col < SPECTRUM_COLS; col++) {
+                spectrumCellRect(info, row, col, r);
+
+                // 按下高亮
+                boolean pressed = false;
+                for (int p = 0; p < pointerSpectrumCell.length && !pressed; p++) {
+                    if (pointerSpectrumCell[p] == row * 10 + col) pressed = true;
+                }
+                if (pressed) {
+                    sprite.setColor(0.3f, 0.5f, 0.8f, 0.95f);
+                } else if (col == 0) {
+                    sprite.setColor(0.16f, 0.18f, 0.26f, 0.75f);   // 值不点，颜色略暗区分
+                } else {
+                    sprite.setColor(0.2f, 0.2f, 0.3f, 0.7f);
+                }
+                sprite.draw(whitePixel, r[0], r[1], r[2], r[3]);
+
+                String label;
+                if (col == 0) {
+                    label = fieldNames[row] + ": " + spectrumValues[row];
+                } else {
+                    label = (col == 1) ? "[-]" : "[+]";
+                }
+                font.setColor(col == 0 ? 0.9f : 1f, col == 0 ? 0.95f : 1f, 1f, 0.95f);
+                glyph.setText(font, label);
+                font.draw(sprite, label, r[0] + (r[2] - glyph.width) / 2, r[1] + (r[3] + glyph.height) / 2);
+            }
+        }
+
+        // 底部操作提示（放在最后一行下方）
+        String hint = "Y = " + (spectrumValues[1]) + "px from BOTTOM   (long-press -/+ to repeat)";
+        font.setColor(0.55f, 0.6f, 0.7f, 0.9f);
+        glyph.setText(font, hint);
+        font.draw(sprite, hint, info.x + (info.w - glyph.width) / 2, info.y + PANEL_PAD * 0.6f);
     }
 
     // ─────────────────── NUM5 长按模式：7K 覆盖层 ───────────────────
@@ -748,7 +971,6 @@ public class FloatingMenu implements InputProcessor {
         float pageBarHeight;
         int totalPages;
         int startIdx, endIdx;
-        boolean isSpectrumPage;
         int cols;
     }
 
@@ -769,14 +991,18 @@ public class FloatingMenu implements InputProcessor {
         res.endIdx = Math.min(res.startIdx + ITEMS_PER_PAGE, visibleCount);
         int itemCount = res.endIdx - res.startIdx;
 
-        res.isSpectrumPage = (SPECTRUM_START >= res.startIdx && SPECTRUM_START < res.endIdx);
-        res.cols = res.isSpectrumPage ? 3 : 2;
+        res.cols = 2;
         int rows = (itemCount + res.cols - 1) / res.cols;
 
         res.w = res.cols * BTN_W + (res.cols - 1) * BTN_GAP + PANEL_PAD * 2;
         res.h = rows * BTN_H + (rows - 1) * BTN_GAP + PANEL_PAD * 2 + (res.pageBarHeight > 0 ? res.pageBarHeight + 4 : 0);
 
-        // 定位逻辑
+        anchorPanel(res);
+        return res;
+    }
+
+    /** 面板锚定：跟随浮动图标的位置，并做屏幕边界保护（通用列表页与频谱调整页共用） */
+    private void anchorPanel(PanelLayout res) {
         Config config = null;
         if (kbInput != null && kbInput.getMainController() instanceof MainController) {
             config = ((MainController) kbInput.getMainController()).getConfig();
@@ -802,8 +1028,41 @@ public class FloatingMenu implements InputProcessor {
         if (res.x + res.w > logicW - 10) res.x = logicW - res.w - 10;
         if (res.y < 10) res.y = 10;
         if (res.y + res.h > logicH - 10) res.y = logicH - res.h - 10;
+    }
 
+    // ─── In-Game Spectrum 调整页（独立模态页）───
+
+    /** 频谱调整页布局：3 列（值 / [-] / [+]）× 4 行（X / Y / W / H）+ 标题栏 */
+    private PanelLayout calculateSpectrumPanelLayout() {
+        PanelLayout res = new PanelLayout();
+        res.cols = SPECTRUM_COLS;
+        res.w = SPECTRUM_COLS * BTN_W + (SPECTRUM_COLS - 1) * BTN_GAP + PANEL_PAD * 2;
+        res.h = SPECTRUM_ROWS * BTN_H + (SPECTRUM_ROWS - 1) * BTN_GAP + PANEL_PAD * 2 + SPECTRUM_TITLE_H;
+        anchorPanel(res);
         return res;
+    }
+
+    /**
+     * 频谱调整页单个单元格的矩形（draw 与 hitTest 共用同一份计算，避免两者不一致）。
+     *
+     * @param row 0..3 = X/Y/W/H
+     * @param col 0 = 值显示, 1 = [-], 2 = [+]
+     */
+    private void spectrumCellRect(PanelLayout info, int row, int col, float[] out) {
+        float contentTop = info.y + info.h - PANEL_PAD - SPECTRUM_TITLE_H;
+        out[0] = info.x + PANEL_PAD + col * (BTN_W + BTN_GAP);
+        out[1] = contentTop - (row + 1) * BTN_H - row * BTN_GAP;
+        out[2] = BTN_W;
+        out[3] = BTN_H;
+    }
+
+    /** 标题栏返回按钮矩形 */
+    private void spectrumBackRect(PanelLayout info, float[] out) {
+        float barY = info.y + info.h - PANEL_PAD - SPECTRUM_TITLE_H;
+        out[0] = info.x + PANEL_PAD;
+        out[1] = barY;
+        out[2] = BTN_H;
+        out[3] = SPECTRUM_TITLE_H;
     }
 
     // ─────────────────── InputProcessor 事件驱动触摸处理 ───────────────────
@@ -857,11 +1116,47 @@ public class FloatingMenu implements InputProcessor {
         if (expanded) {
             // 展开状态：检查是否点击了图标（关闭菜单）
             if (hitTestIcon(tx, ty)) {
+                if (spectrumAdjustOpen) exitSpectrumAdjust();
                 expanded = false;
                 pointerConsuming[pointer] = true;
                 pointerPressedIndex[pointer] = -1;
                 return true;
             }
+
+            // 频谱调整页：独立模态，命中判定与绘制共用同一套矩形
+            if (spectrumAdjustOpen) {
+                int hit = hitTestSpectrumPage(tx, ty);
+                if (hit == SPECTRUM_HIT_OUTSIDE) {
+                    // 点面板外：只退出调整页、不关整个菜单（避免误触把菜单一起收掉）
+                    exitSpectrumAdjust();
+                    pointerConsuming[pointer] = true;
+                    pointerPressedIndex[pointer] = -1;
+                    return true;
+                }
+                if (hit == SPECTRUM_HIT_BACK) {
+                    exitSpectrumAdjust();
+                    pointerConsuming[pointer] = true;
+                    pointerPressedIndex[pointer] = -1;
+                    return true;
+                }
+                pointerSpectrumCell[pointer] = (hit >= 0) ? hit : -1;
+                if (hit >= 0) {
+                    int row = hit / 10;
+                    int col = hit % 10;
+                    if (col == 1 || col == 2) {
+                        // [-] / [+]：立即走一步，并开启长按连发
+                        spectrumHoldField = row;
+                        spectrumHoldDir = (col == 1) ? -1 : 1;
+                        spectrumHoldStartNs = System.nanoTime();
+                        spectrumHoldLastRepeatNs = spectrumHoldStartNs;
+                        spectrumStep(row, spectrumHoldDir);
+                    }
+                }
+                pointerConsuming[pointer] = true;
+                pointerPressedIndex[pointer] = -1;
+                return true;
+            }
+
             // 检查是否点到了按钮
             int itemHit = hitTestPanel(tx, ty);
             if (itemHit >= 0) {
@@ -930,6 +1225,11 @@ public class FloatingMenu implements InputProcessor {
                 pointerConsuming[pointer] = false;
                 return true;
             }
+            // 频谱调整页：抬手即停止连发并落盘
+            if (spectrumAdjustOpen) {
+                pointerSpectrumCell[pointer] = -1;
+                stopSpectrumHold(true);
+            }
             // 检查是否抬起了手指在按钮上
             int pressedIdx = pointerPressedIndex[pointer];
             if (expanded && pressedIdx >= 0) {
@@ -988,13 +1288,10 @@ public class FloatingMenu implements InputProcessor {
 
     @Override
     public boolean keyDown(int keycode) {
-        // ESC取消编辑，ENTER确认
-        if (editingField >= 0) {
-            if (keycode == Keys.ESCAPE) {
-                cancelEdit();
-                return true;
-            } else if (keycode == Keys.ENTER) {
-                commitAdjust(false);
+        // 频谱调整页：ESC / BACK 返回
+        if (spectrumAdjustOpen) {
+            if (keycode == Keys.ESCAPE || keycode == Keys.BACK) {
+                exitSpectrumAdjust();
                 return true;
             }
         }
@@ -1091,16 +1388,8 @@ public class FloatingMenu implements InputProcessor {
             }
         }
 
-        // 收集可见按钮索引
-        int visibleCount = 0;
-        for (MenuItem item : items) { if (isItemVisible(item)) visibleCount++; }
-        int[] visibleIndices = new int[visibleCount];
-        int idx = 0;
-        for (int i = 0; i < items.length; i++) {
-            if (isItemVisible(items[i])) {
-                visibleIndices[idx++] = i;
-            }
-        }
+        // 收集可见按钮索引（含 PLAY 界面的顺序覆盖；绘制与命中判定同一份顺序）
+        int[] visibleIndices = buildVisibleIndexOrder();
 
         float contentTop = info.y + info.h - PANEL_PAD - (info.pageBarHeight > 0 ? info.pageBarHeight + 4 : 0);
         for (int j = info.startIdx; j < info.endIdx; j++) {
@@ -1149,29 +1438,9 @@ public class FloatingMenu implements InputProcessor {
             return;
         }
 
-        if (item.keycode == -100 || item.keycode == -130 || item.keycode == -140) return; // Toggle/action 类型在 touchUp 处理
-
-        // 频谱调整 +/- 按钮：启动长按定时
-        if (item.keycode >= -128 && item.keycode <= -121) {
-            int fieldIdx = getFieldIndexFromAdjustButton(item.keycode);
-            if (fieldIdx >= 0) {
-                editingField = fieldIdx;
-                editValue = getFieldValue(fieldIdx);
-                adjustDelta = (fieldIdx >= 2) ? 10 : 1; // X/Y=1pixel, W/H=10
-                adjustDirection = (item.keycode % 2 != 0) ? -1 : +1; // 奇数=-, 偶数=+ (负奇数%2!=0也成立)
-                adjustStartTime = System.nanoTime();
-                shortPressCommitted = false;
-                return;
-            }
-        }
-
-        // 频谱调整项 X/Y/W/H 选择器
-        if (item.keycode >= -114 && item.keycode <= -111) {
-            int fieldIndex = -(item.keycode + 111); // -111→0, -112→1, -113→2, -114→3
-            editingField = fieldIndex;
-            editValue = getFieldValue(fieldIndex);
-            updateFieldLabel(fieldIndex, editValue);
-            return;
+        if (item.keycode == -100 || item.keycode == -130 || item.keycode == WALKURE_KEYCODE
+                || item.keycode == SPECTRUM_ENTRY_KEYCODE) {
+            return; // Toggle/action 类型（含 In-Game Spectrum 入口）在 touchUp 处理
         }
 
         if (kbInput != null) {
@@ -1185,31 +1454,14 @@ public class FloatingMenu implements InputProcessor {
         if (index < 0 || index >= items.length) return;
         MenuItem item = items[index];
 
-        if (item.keycode == -100 || item.keycode == -130 || item.keycode == -140) {
+        if (item.keycode == -100 || item.keycode == -130 || item.keycode == WALKURE_KEYCODE
+                || item.keycode == SPECTRUM_ENTRY_KEYCODE) {
             handleToggle(item);
             return;
         }
 
         // 长按模式（NUM5/START）是切换式，不在 touchUp 时释放
         if (item.keycode == Keys.NUM_5 || item.keycode == -141) {
-            return;
-        }
-
-        // 频谱调整 +/- 按钮：停止长按定时
-        if (item.keycode >= -128 && item.keycode <= -121) {
-            adjustStartTime = 0;
-            adjustDirection = 0;
-            shortPressCommitted = false;
-            // 短按或长按释放时都要提交并保存
-            commitAdjust(true);
-            return;
-        }
-
-        // 频谱调整项 X/Y/W/H 选择器
-        if (item.keycode >= -114 && item.keycode <= -111) {
-            int fieldIndex = -(item.keycode + 111);
-            editingField = fieldIndex;
-            editValue = getFieldValue(fieldIndex);
             return;
         }
 
@@ -1251,9 +1503,12 @@ public class FloatingMenu implements InputProcessor {
                             ((MainController) mainController).changeState(MainState.MainStateType.MUSICPLAYER);
                         }
                     }
-                } else if (item.keycode == -140) {
+                } else if (item.keycode == WALKURE_KEYCODE) {
                     // Player Rating entry - show in WebView via AndroidLauncher
                     showPlayerRating();
+                } else if (item.keycode == SPECTRUM_ENTRY_KEYCODE) {
+                    // In-Game Spectrum 调整页（仅 PLAY 界面可见）
+                    enterSpectrumAdjust();
                 }
             }
         }
@@ -1275,107 +1530,6 @@ public class FloatingMenu implements InputProcessor {
         if (vpH <= 0 || logicH <= 0) return screenY;
         // 屏幕 Y 从上往下，逻辑 Y 从下往上
         return logicH - (screenY - vpY) * (float) logicH / vpH;
-    }
-
-    // ─────────────────── 频谱编辑模式 ───────────────────
-
-    /** 从 +/- 按钮获取对应的 field 索引 */
-    private int getFieldIndexFromAdjustButton(int keycode) {
-        // -121,-122=X+-, -123,-124=Y+-, -125,-126=W+-, -127,-128=H+-
-        if (keycode == -121 || keycode == -122) return 0;
-        if (keycode == -123 || keycode == -124) return 1;
-        if (keycode == -125 || keycode == -126) return 2;
-        if (keycode == -127 || keycode == -128) return 3;
-        return -1;
-    }
-
-    /** 获取指定 field 的当前值 */
-    private int getFieldValue(int field) {
-        Object mc = kbInput != null ? kbInput.getMainController() : null;
-        if (mc instanceof MainController) {
-            PlayerConfig pc = ((MainController) mc).getPlayerConfig();
-            if (pc != null) {
-                switch (field) {
-                    case 0: return pc.getSpectrumOffsetX();
-                    case 1: return pc.getSpectrumOffsetY();
-                    case 2: return pc.getSpectrumOffsetW();
-                    case 3: return pc.getSpectrumOffsetH();
-                }
-            }
-        }
-        return 0;
-    }
-
-    /** 更新指定 field 的标签显示 */
-    private void updateFieldLabel(int field, int value) {
-        String prefix;
-        switch (field) {
-            case 0: prefix = "X:"; break;
-            case 1: prefix = "Y:"; break;
-            case 2: prefix = "W:"; break;
-            case 3: prefix = "H:"; break;
-            default: return;
-        }
-        // items 排列：0-13通用 + 14Rating + 15-26频谱调整(X/Y/W/H各3个) + 27-29 Controller Reset
-        items[15 + field * 3].label = prefix + " " + value;
-    }
-
-    /** 提交调整值到 PlayerConfig 并保存 */
-    private void commitAdjust(boolean forceSave) {
-        if (editingField < 0) return;
-        Object mc = kbInput != null ? kbInput.getMainController() : null;
-        if (mc instanceof MainController) {
-            MainController main = (MainController) mc;
-            PlayerConfig pc = main.getPlayerConfig();
-            if (pc != null) {
-                switch (editingField) {
-                    case 0: pc.setSpectrumOffsetX(editValue); break;
-                    case 1: pc.setSpectrumOffsetY(editValue); break;
-                    case 2: pc.setSpectrumOffsetW(editValue); break;
-                    case 3: pc.setSpectrumOffsetH(editValue); break;
-                }
-                PlayerConfig.write(main.getConfig().getPlayerpath(), pc);
-                Object game = main.getBeatorajaGame();
-                if (game != null && game instanceof com.starxh.beatoraja.BeatorajaGame) {
-                    ((com.starxh.beatoraja.BeatorajaGame) game).updateSpectrumConfig();
-                }
-                Gdx.app.log("FloatingMenu", "Spectrum " + editingField + " = " + editValue);
-            }
-        }
-        editingField = -1;
-        adjustStartTime = 0;
-        adjustDirection = 0;
-    }
-
-    /** 取消编辑，恢复原值 */
-    private void cancelEdit() {
-        if (editingField >= 0) {
-            updateFieldLabel(editingField, getFieldValue(editingField));
-        }
-        editingField = -1;
-        adjustStartTime = 0;
-        adjustDirection = 0;
-    }
-
-    private void exitEdit() {
-        editingField = -1;
-        adjustStartTime = 0;
-        adjustDirection = 0;
-    }
-
-    private void refreshSpectrumLabels() {
-        for (int i = 0; i < 4; i++) {
-            int value = getFieldValue(i);
-            String prefix;
-            switch (i) {
-                case 0: prefix = "X:"; break;
-                case 1: prefix = "Y:"; break;
-                case 2: prefix = "W:"; break;
-                case 3: prefix = "H:"; break;
-                default: prefix = "?"; break;
-            }
-            items[13 + i * 3].label = prefix + " " + value;
-        }
     }
 
     // ─────────────────── 玩家实力表 ───────────────────

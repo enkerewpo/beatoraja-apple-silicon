@@ -41,7 +41,14 @@ public class SkinBGA extends SkinObject {
 		}
 		this.time = time;
 		super.prepare(time, state);
-		if(draw) {
+		// 练习模式：本层还要负责画参数面板，所以即使图层条件不成立也要画。
+		// （dst 上通常挂着 op = {41} OPTION_BGAON，而 BGA_AUTO 模式下
+		//   BMSResource 只在 AUTOPLAY/REPLAY 时把 bgaon 置真 —— 练习与普通游玩都会是假，
+		//   面板就会整块消失，表现为"练习模式里看不到参数调整"。）
+		if (player.resource.getPlayMode().mode == BMSPlayerMode.Mode.PRACTICE) {
+			draw = true;
+		}
+		if(draw && player.resource.getBGAManager() != null) {
 			final int s = player.getState();
 			player.resource.getBGAManager().prepareBGA(
 					s == BMSPlayer.STATE_PRELOAD || s == BMSPlayer.STATE_PRACTICE || s == BMSPlayer.STATE_READY ? -1
@@ -52,7 +59,13 @@ public class SkinBGA extends SkinObject {
 	public void draw(SkinObjectRenderer sprite) {
 		final PlayerResource resource = player.resource;
 		if (resource.getPlayMode().mode == BMSPlayerMode.Mode.PRACTICE) {
-			player.getPracticeConfiguration().draw(region, sprite, time, player);
+			// 练习模式的参数面板（START TIME / GAUGE / ... 与 note 密度图）画在本层位置：
+			// BGA 之上、游玩层（lane / notes / keybeam / judge）之下。
+			// 触摸版皮肤例外：它的轨道背景是一整块不透明矩形，画在这里会被整块盖住，
+			// 改由 BMSPlayer#drawPracticeOverlay 叠加到最上层（50% 透明 + 不画密度图）。
+			if (!player.getPracticeConfiguration().isOverlayOnTop(player.getSkin())) {
+				player.getPracticeConfiguration().draw(region, sprite, time, player);
+			}
 		} else if (resource.getBGAManager() != null) {
 			resource.getBGAManager().drawBGA(this,sprite,region);
 		}		

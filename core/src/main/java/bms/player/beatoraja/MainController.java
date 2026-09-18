@@ -777,6 +777,11 @@ public class MainController {
         if (current.getSkin() != null) {
             current.getSkin().updateCustomObjects(current);
             current.getSkin().drawAllObjects(sprite, current);
+            // 触摸版皮肤的练习参数面板要在皮肤之后叠加（该皮肤轨道背景不透明，画在 BGA 层会被整块盖住）。
+            // 其他皮肤不受影响：内部会判定，非触摸皮肤直接返回，仍由 SkinBGA 在 BGA 层绘制。
+            if (current instanceof BMSPlayer) {
+                ((BMSPlayer) current).drawPracticeOverlay(current.getSkin().getObjectRenderer());
+            }
         }
         sprite.end();
         // [DEBUG PROBE] >16ms 慢帧报警 — 正常运行时禁用
@@ -1192,6 +1197,11 @@ public class MainController {
     public MusicDownloadProcessor getMusicDownloadProcessor(){ return download; }
     public MessageRenderer getMessageRenderer() { return messageRenderer; }
     public FloatingMenu getFloatingMenu() { return floatingMenu; }
+
+    /** 浮動菜单的 In-Game Spectrum 调整页是否打开（用于在其他界面也预览频谱） */
+    public boolean isSpectrumAdjustOpen() {
+        return floatingMenu != null && floatingMenu.isSpectrumAdjustOpen();
+    }
 
     public void updateMainStateListener(int status) {
         for(MainStateListener listener : stateListener) {
