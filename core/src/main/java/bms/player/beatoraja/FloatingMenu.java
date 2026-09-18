@@ -50,6 +50,13 @@ public class FloatingMenu implements InputProcessor {
     private boolean keyConfigMode = false; // 是否为 KeyConfig 界面
     private boolean skinSelectMode = false; // 是否为 SkinSelect 界面（皮肤选择/配置）
     private boolean isPlayMode = false; // 是否为 Play 界面
+    /** 是否为 Practice 模式（PLAY 界面且 resource.getPlayMode()==PRACTICE）。
+     *  Practice 下浮动图标<b>常驻显示</b>（不参与 PLAY 的自动隐藏），
+     *  并以 {@link #PRACTICE_ICON_ALPHA} 的不透明度绘制 —— 仅对 practice 生效，
+     *  普通游玩 / AUTOPLAY / REPLAY 不受影响。 */
+    private boolean practiceMode = false;
+    /** Practice 模式下浮动图标的绘制不透明度（30%，常驻但不抢视线） */
+    private static final float PRACTICE_ICON_ALPHA = 0.3f;
     /** Play 模式时：距上次交互超过此时间则自动隐藏图标（秒） */
     private static final float HIDE_DELAY = 0f;
     /** Play 模式时：距上次交互已过时间（秒） */
@@ -320,6 +327,16 @@ public class FloatingMenu implements InputProcessor {
         }
     }
 
+    /** 设置是否为 Practice 模式（图标常驻显示 + 30% 不透明度，仅对 practice 生效） */
+    public void setPracticeMode(boolean practiceMode) {
+        this.practiceMode = practiceMode;
+        if (practiceMode) {
+            // 常驻显示：清掉 PLAY 模式的超时隐藏状态，避免进入 practice 时图标已被标记隐藏
+            sinceLastInteraction = 0f;
+            playIconHidden = false;
+        }
+    }
+
     /** 判断按钮是否在当前界面显示 */
     private boolean isItemVisible(MenuItem item) {
         if (selectMode && !item.showOnSelect) return false;
@@ -443,8 +460,8 @@ public class FloatingMenu implements InputProcessor {
             }
         }
 
-        // Play 模式：1秒无操作则自动隐藏图标
-        if (isPlayMode && visible && !expanded) {
+        // Play 模式：无操作则自动隐藏图标（Practice 模式常驻显示，不参与自动隐藏）
+        if (isPlayMode && !practiceMode && visible && !expanded) {
             sinceLastInteraction += delta;
             if (sinceLastInteraction >= HIDE_DELAY) {
                 playIconHidden = true;
@@ -482,8 +499,8 @@ public class FloatingMenu implements InputProcessor {
         boolean showIcon = !(isPlayMode && playIconHidden);
 
         if (showIcon) {
-            // 绘制浮动图标
-            sprite.setColor(1, 1, 1, 0.55f);
+            // 绘制浮动图标（Practice 模式用 30% 不透明度常驻显示）
+            sprite.setColor(1, 1, 1, practiceMode ? PRACTICE_ICON_ALPHA : 0.55f);
             sprite.draw(iconTexture, iconX, iconY, ICON_SIZE, ICON_SIZE);
         }
 

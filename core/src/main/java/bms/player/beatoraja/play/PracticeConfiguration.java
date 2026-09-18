@@ -57,12 +57,12 @@ public final class PracticeConfiguration {
 		// TODO スキン定義がない場合のデフォルト配置の定義
 	}
 
-	private SkinNoteDistributionGraph[] graph = { 
+	private SkinNoteDistributionGraph[] graph = {
 			new SkinNoteDistributionGraph(SkinNoteDistributionGraph.TYPE_NORMAL, 500, 0, 0, 0, 0),
 			new SkinNoteDistributionGraph(SkinNoteDistributionGraph.TYPE_JUDGE, 500, 0, 0, 0, 0),
 			new SkinNoteDistributionGraph(SkinNoteDistributionGraph.TYPE_EARLYLATE, 500, 0, 0, 0, 0),
 	};
-	
+
 	private static final String[] GRAPHTYPESTR = {"NOTETYPE", "JUDGE", "EARLYLATE"};
 
 	public static final PracticeElement[] elements = PracticeElement.values();
@@ -87,9 +87,10 @@ public final class PracticeConfiguration {
 		if(property.total == 0) {
 			property.total = model.getTotal();
 		}
-		// Get pre-loaded 18pt system font from global cache (eliminates runtime I/O)
-		titlefont = main.getSystemFont18();
-		
+		// 注意：这里不再缓存字体引用 —— titlefont 改为 draw() 每帧从全局缓存重取，
+		// 否则 MainController.resume()（切后台→切回）重建 systemfont18 后，
+		// 旧引用指向已 dispose 的纹理，参数文字会整体消失
+
 		for(int i = 0; i < graph.length; i++) {
 			graph[i].setDestination(0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, new int[0]);
 		}
@@ -115,7 +116,7 @@ public final class PracticeConfiguration {
 		gauge.setValue(property.startgauge);
 		return gauge;
 	}
-	
+
 	public void processInput(BMSPlayerInputProcessor input) {
 		if (input.isControlKeyPressed(ControlKeys.UP)) {
 			do {
@@ -147,6 +148,9 @@ public final class PracticeConfiguration {
 	}
 
 	public void draw(Rectangle r, SkinObjectRenderer sprite, long time, MainState state) {
+		// 每帧重取字体：切后台再切回时 MainController.resume() 会重建 systemfont18
+		// （旧 BitmapFont 被 dispose、生成新对象），缓存的旧引用会画不出任何文字
+		titlefont = state.main.getSystemFont18();
 		updateLayoutMode(state.getSkin());
 		float x = r.x + r.width / 8;
 		float y = r.y + r.height * 7 / 8;
@@ -188,7 +192,7 @@ public final class PracticeConfiguration {
 	private Skin layoutSkin;
 	/** 触摸版皮肤（GenericTheme for Touchscreen 等）：叠加在最上层 + 半透明 + 不画密度图 */
 	private boolean touchScreen;
-	/** 文字透明度：触摸皮肤 0.3，其他皮肤 1 */
+	/** 文字透明度：触摸皮肤 0.2，其他皮肤 1 */
 	private float textAlpha = 1f;
 	/** 是否绘制 note 分布图 */
 	private boolean drawGraph = true;
@@ -202,7 +206,7 @@ public final class PracticeConfiguration {
 	 *
 	 * <p>触摸版皮肤的轨道背景是一整块<b>不透明</b>矩形（竖屏时铺满全屏），
 	 * 参数面板画在 BGA 层会被它整块盖住 —— 这就是"练习模式看不到参数调整"的原因。
-	 * 配合 30% 透明度与去掉密度图，叠加在最上层也不会太挡 note。</p>
+	 * 配合 15% 透明度与去掉密度图，叠加在最上层也不会太挡 note。</p>
 	 */
 	public boolean isOverlayOnTop(Skin skin) {
 		updateLayoutMode(skin);
@@ -215,7 +219,7 @@ public final class PracticeConfiguration {
 		}
 		layoutSkin = skin;
 		touchScreen = isTouchscreenSkin(skin);
-		textAlpha = touchScreen ? 0.3f : 1f;
+		textAlpha = touchScreen ? 0.20f : 1f;
 		drawGraph = !touchScreen;
 		textAngle = touchScreen && isPortraitLayout(skin) ? 270f : 0f;
 	}
@@ -272,14 +276,14 @@ public final class PracticeConfiguration {
 		sprite.draw(titlefont, textLayout, px, py, px, py, textAngle);
 	}
 
-	/** 按 textAlpha 调暗（触摸皮肤用 50% 透明） */
+	/** 按 textAlpha 调暗（触摸皮肤 20% 不透明度） */
 	private Color tint(Color base) {
 		if (textAlpha >= 1f) {
 			return base;
 		}
 		return tempColor.set(base.r, base.g, base.b, base.a * textAlpha);
 	}
-	
+
 	public void dispose() {
 		// Font is now globally cached in MainController - don't dispose it here
 		// if(titlefont != null) {

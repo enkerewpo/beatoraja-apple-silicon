@@ -319,6 +319,9 @@ public class LaneRenderer {
 	}
 
 	public void drawLane(SkinObjectRenderer sprite, long time, SkinLane[] lanes, SkinOffset[] offsets, Rectangle viewport) {
+		// 每帧重取字体：切后台再切回时 MainController.resume() 会重建 systemfont18
+		// （旧 BitmapFont 被 dispose），构造时缓存的旧引用会让轨道时间/BPM/STOP 文字消失
+		font = main.main.getSystemFont18();
 		Rectangle visibleViewport = viewport != null ? viewport : DEFAULT_VIEWPORT;
 		float offsetX = 0;
 		float offsetY = 0;

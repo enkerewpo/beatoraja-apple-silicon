@@ -57,12 +57,37 @@ new MenuItem("Show FPS", Keys.F1, false, true, false, true, false, Keys.UP),
 
 | # | 按钮 | 备注 |
 | --- | --- | --- |
-| 1-6 | Touch Key / Walkure / Update Song / Music Player / Skin Select / Key Config | |
+| 1 | Touch Key | |
+| 2 | **Show FPS** | 由 `playInsertBefore=WALKURE_KEYCODE` 占用已隐藏的 Walkure 那一格 |
+| 3-6 | Update Song / Music Player / Skin Select / Key Config | |
 | 7 | ESC | |
-| 8 | **Show FPS** | 由 `playInsertBefore=Keys.UP` 移到这里（原 Enter 的位置）|
-| 9-12 | ^ UP / v DOWN / < LEFT / > RIGHT | |
-| 13 | In-Game Spectrum | 仅 PLAY 可见 |
+| 8-11 | ^ UP / v DOWN / < LEFT / > RIGHT | |
+| 12 | In-Game Spectrum | 仅 PLAY 可见 |
 
+- `Walkure` 在 PLAY 界面隐藏（`showOnPlay=false`），其位置由 Show FPS 占用；
+  在选曲等界面 Walkure 仍显示在数组原位。
 - `Enter` 在 PLAY 界面已隐藏（`showOnPlay=false`）；在 KeyConfig / SkinSelect 仍正常显示。
-- `Show FPS` 在选曲等界面仍是数组末尾位置。
-- PLAY 里浮動菜单本身还受 `Config.showFloatingMenuInPlay` 开关控制（默认 true）。
+- PLAY 里浮动菜单本身还受 `Config.showFloatingMenuInPlay` 开关控制（默认 true），
+  但 **practice 模式例外**（见下节）。
+
+## 四、Practice 模式：图标常驻 + 30% 不透明度
+
+仅对 practice 生效（普通游玩 / AUTOPLAY / REPLAY 行为不变）。
+
+**判定**：`MainController.changeState()` 里
+
+```java
+state == PLAY && resource.getPlayMode().mode == BMSPlayerMode.Mode.PRACTICE
+```
+
+为 true 时调用 `floatingMenu.setPracticeMode(true)`；离开 PLAY 一律置回 false。
+
+**效果**（`FloatingMenu`）：
+
+1. **常驻显示**：不参与 PLAY 的"无操作自动隐藏"（`render()` 的超时分支加了
+   `!practiceMode`），且 `setPracticeMode(true)` 会清掉已累积的隐藏状态；
+   同时**不受 `Config.showFloatingMenuInPlay` 限制** —— practice 下强制可见；
+2. **30% 不透明度**：图标以 `PRACTICE_ICON_ALPHA = 0.3f` 绘制（普通模式 0.55f），
+   常驻但不抢视线。只影响收起态的浮动图标；展开后的面板仍是正常不透明度。
+
+要调透明度改 `FloatingMenu.PRACTICE_ICON_ALPHA` 一个值即可。

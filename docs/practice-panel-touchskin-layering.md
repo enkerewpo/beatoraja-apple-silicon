@@ -41,7 +41,7 @@
 | 项 | 触摸版 | 其他皮肤 |
 | --- | --- | --- |
 | 绘制位置 | 皮肤画完后叠加（`MainController` → `BMSPlayer#drawPracticeOverlay`） | `SkinBGA` 的 BGA 层（在 lane/notes 之下，上游行为） |
-| 文字透明度 | 30% | 100% |
+| 文字透明度 | 15% | 100% |
 | note 分布图 | 不绘制 | 绘制 |
 | 文字旋转 | 竖屏（Layout 选项 = Portrait）时 270° | 0° |
 
@@ -89,9 +89,27 @@
 ## 四、当前状态与可调项
 
 - 竖屏文字方向、位置已确认：锚点在右边缘（`r.x + r.width - 40`，文字块向左展开），
-  透明度 30%。
+  透明度 15%（原 30%，2026-09-18 应用户要求调低）。
 - 若想上下挪：改锚点 y（`r.y + r.height * 7 / 8`）—— 竖屏下 y 才是设备的上下方向。
 - 若想让面板"在轨道之下"（不再是叠加层）：需要给皮肤一个可在图层顺序中摆放的
   面板对象（例如新增一个 play 皮肤专用的 dst id / 皮肤字段，在 `play.lua` 里放到
   "轨道背景之后、note 之前"），那时面板天然在 note 之下、也被收尾动画盖住。
   当前叠加层方案是折中：保证触摸皮肤竖屏可见（原因见第二节）。
+
+## 五、切后台后参数字体消失的修复（2026-09-18）
+
+**现象**：practice 模式切后台再切回来，参数面板（有时还有轨道上的时间/BPM 文字）不显示。
+
+**根因**：`MainController.resume()`（`BeatorajaGame.resume()` → `controller.resume()`）
+在每次回到前台时都会 **dispose 旧的 systemfont / systemfont18 并重新生成新的 BitmapFont
+对象**（GL 上下文可能丢失，纹理必须重建）。而 `PracticeConfiguration.create()` 和
+`LaneRenderer` 构造函数各自**缓存了 `getSystemFont18()` 的引用**——重建后旧引用指向
+已释放的纹理，`font != null` 检查形同虚设，画出来就是"什么都没有"。
+
+**修法**：放弃缓存，改为**每帧重取**（getter 只是返回字段，开销可忽略）：
+
+- `PracticeConfiguration.draw()` 开头：`titlefont = state.main.getSystemFont18();`
+- `LaneRenderer.drawLane(...)` 入口：`font = main.main.getSystemFont18();`
+
+**推论**：今后任何持有 `getSystemFont()`/`getSystemFont18()` 返回值**跨帧引用**的代码
+都会在切后台后失效，一律按此模式每帧重取，或监听重建事件刷新引用。

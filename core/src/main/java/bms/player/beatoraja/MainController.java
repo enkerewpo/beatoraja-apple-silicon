@@ -424,6 +424,14 @@ public class MainController {
             // 浮动菜单：在 PLAY / DECIDE / MUSICPLAYER 状态隐藏（除非 config 允许在 PLAY 显示）
             if (floatingMenu != null) {
                 boolean menuVisible = state != MainStateType.PLAY && state != MainStateType.DECIDE && state != MainStateType.MUSICPLAYER;
+                // Practice 模式：浮动图标常驻显示，不受 isShowFloatingMenuInPlay 配置限制
+                // （常驻 + 30% 不透明度绘制，见 FloatingMenu#setPracticeMode）
+                final boolean practicePlay = state == MainStateType.PLAY
+                        && resource != null && resource.getPlayMode() != null
+                        && resource.getPlayMode().mode == BMSPlayerMode.Mode.PRACTICE;
+                if (practicePlay) {
+                    menuVisible = true;
+                }
                 if (state == MainStateType.PLAY && config != null && config.isShowFloatingMenuInPlay()) {
                     menuVisible = true;
                 }
@@ -436,6 +444,7 @@ public class MainController {
                 floatingMenu.setKeyConfigMode(state == MainStateType.CONFIG);
                 floatingMenu.setSkinSelectMode(state == MainStateType.SKINCONFIG);
                 floatingMenu.setPlayMode(state == MainStateType.PLAY);
+                floatingMenu.setPracticeMode(practicePlay);
             }
             // 将 FloatingMenu 作为最高优先级处理器加入 InputMultiplexer
             if (current != null && current.getStage() != null) {
