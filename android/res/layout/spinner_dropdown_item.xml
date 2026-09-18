@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Spinner 下拉列表项。
+     注意：背景必须保持"透明或只画高光"，不能是整块不透明色 ——
+     不透明背景会盖住系统画在项下面的 list selector，手柄操作时就看不到光标在哪。
+     下拉面板的深色底由 Spinner 的 android:popupBackground 提供。 -->
 <TextView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
     android:textColor="#FFFFFF"
     android:textSize="16sp"
     android:padding="12dp"
-    android:background="#333333"/>
+    android:background="@drawable/dropdown_item_bg" />

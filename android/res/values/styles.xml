@@ -4,5 +4,9 @@
         <item name="android:colorBackground">@color/background</item>
         <item name="android:windowFullscreen">true</item>
         <item name="android:windowSoftInputMode">adjustResize|stateAlwaysHidden</item>
+        <!-- 列表当前行高光：Material Light 的默认高光在深色项上几乎看不见（手柄操作时
+             看不出选到哪一项），这里换成对比度足够的蓝色。作用于 Spinner 下拉列表、
+             字母轮盘 GridView、对话框里的单选列表等所有 AbsListView。 -->
+        <item name="android:listSelector">@drawable/list_selector_highlight</item>
     </style>
 </resources>

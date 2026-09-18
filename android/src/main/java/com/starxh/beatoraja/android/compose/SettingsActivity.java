@@ -102,6 +102,55 @@ public class SettingsActivity extends Activity {
     private View focusIndicator;
     private boolean gamepadMode = false;
     private long lastGamepadInputTime = 0;
+    /** 摇杆过阈值才触发，且两次移动至少间隔这么久（避免漂移值连跳） */
+    private static final float STICK_THRESHOLD = 0.6f;
+    private static final long STICK_REPEAT_MS = 90;
+    /** 调整态下摇杆左右调值的节流时间（独立于导航节流，间隔更短） */
+    private long lastStickAdjustTime = 0;
+    private long lastStickMoveTime = 0;
+    /** 展开/收起后为 true：等下一帧布局完成再允许移动焦点（否则用的是旧坐标） */
+    private boolean navNeedsLayout = false;
+    /** 已排队一次"布局后移动"，避免连按堆积成多次移动 */
+    private boolean navDeferred = false;
+    /**
+     * 当前处于"调整态"的滑块：用 A 键选中后，左右/摇杆左右才能调值，且此时上下不滚动；
+     * 再按一次 A（或 B）退出。null = 没有滑块处于调整态。
+     */
+    private android.widget.SeekBar adjustingSeekBar = null;
+    /** 调整态连发状态：0 = 没有按住；±1 = 正按住 LEFT/RIGHT 连续调整 */
+    private int seekRepeatDirection = 0;
+    /** 连发已触发次数（用于按住越久越快的加速） */
+    private int seekRepeatCount = 0;
+    private final android.os.Handler seekRepeatHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    /**
+     * 软件连发：手柄十字键大多没有系统级自动重复（键盘才有），
+     * 按住只走一步 —— "不能连续滑动"的根因。首延 175ms，之后每 55ms 一步，
+     * 连发 6 步后间隔减到 30ms（越按越快）。
+     */
+    private final Runnable seekRepeatRunnable = new Runnable() {
+        @Override public void run() {
+            if (seekRepeatDirection == 0 || adjustingSeekBar == null) return;
+            adjustSeekBar(seekRepeatDirection);
+            seekRepeatCount++;
+            seekRepeatHandler.postDelayed(this, seekRepeatCount >= 6 ? 30L : 55L);
+        }
+    };
+    /** 导航连发状态：null = 没有按住方向键；否则按住的方向（上下/左右移动焦点） */
+    private MoveDirection navRepeatDirection = null;
+    private int navRepeatCount = 0;
+    private final android.os.Handler navRepeatHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    /**
+     * 导航软件连发：与滑块连发同理，手柄十字键没有系统级自动重复，
+     * 按住只移动一次焦点。首延 200ms，之后每 80ms 一步、4 步后加速到 60ms。
+     */
+    private final Runnable navRepeatRunnable = new Runnable() {
+        @Override public void run() {
+            if (navRepeatDirection == null || !gamepadMode) return;
+            moveFocus(navRepeatDirection);
+            navRepeatCount++;
+            navRepeatHandler.postDelayed(this, navRepeatCount >= 4 ? 60L : 80L);
+        }
+    };
     private android.widget.ScrollView settingsScrollView;
     private java.util.List<View> focusableControls = new java.util.ArrayList<>();
 
@@ -175,6 +224,11 @@ public class SettingsActivity extends Activity {
 
         // 监听焦点变化，显示手柄高光
         focusChangeListener = (oldFocus, newFocus) -> {
+            // 焦点离开滑块就退出调整态，避免"看着在别的控件上、左右却在改滑块"
+            if (adjustingSeekBar != null && newFocus != adjustingSeekBar) {
+                stopSeekRepeat();
+                adjustingSeekBar = null;
+            }
             if (gamepadMode && newFocus != null) {
                 updateFocusIndicator(newFocus);
                 ensureViewVisible(newFocus);
@@ -195,6 +249,9 @@ public class SettingsActivity extends Activity {
         touchInterceptor.setOnTouchListener((v, event) -> {
             if (gamepadMode) {
                 gamepadMode = false;
+                stopSeekRepeat();
+                stopNavRepeat();
+                adjustingSeekBar = null;
                 if (focusIndicator != null) focusIndicator.setVisibility(View.GONE);
                 Log.i("SettingsActivity", "Touch detected, exiting gamepad mode");
             }
@@ -631,7 +688,11 @@ public class SettingsActivity extends Activity {
         setupGamepadFocusable(systemVolumeSeekBar);
         systemVolumeSeekBar.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) { selectedVolume = progress; volumePercent.setText(progress + "%"); }
+                // 不能只处理 fromUser：手柄/摇杆调整走的是 setProgress()（fromUser=false），
+                // 只认 fromUser 会导致数字文本不刷新，且 selectedVolume 不更新 ——
+                // 保存时写回 JSON 的还是旧值（等于白调）。
+                selectedVolume = progress;
+                volumePercent.setText(progress + "%");
             }
             @Override public void onStartTrackingTouch(android.widget.SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(android.widget.SeekBar seekBar) {}
@@ -644,7 +705,9 @@ public class SettingsActivity extends Activity {
         setupGamepadFocusable(keyVolumeSeekBar);
         keyVolumeSeekBar.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) { selectedKeyVolume = progress; keyVolumePercent.setText(progress + "%"); }
+                // 同 systemVolume：手柄调整不产生 fromUser=true，必须无条件同步
+                selectedKeyVolume = progress;
+                keyVolumePercent.setText(progress + "%");
             }
             @Override public void onStartTrackingTouch(android.widget.SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(android.widget.SeekBar seekBar) {}
@@ -657,7 +720,9 @@ public class SettingsActivity extends Activity {
         setupGamepadFocusable(bgmVolumeSeekBar);
         bgmVolumeSeekBar.setOnSeekBarChangeListener(new android.widget.SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(android.widget.SeekBar seekBar, int progress, boolean fromUser) {
-                if (fromUser) { selectedBgmVolume = progress; bgmVolumePercent.setText(progress + "%"); }
+                // 同 systemVolume：手柄调整不产生 fromUser=true，必须无条件同步
+                selectedBgmVolume = progress;
+                bgmVolumePercent.setText(progress + "%");
             }
             @Override public void onStartTrackingTouch(android.widget.SeekBar seekBar) {}
             @Override public void onStopTrackingTouch(android.widget.SeekBar seekBar) {}
@@ -738,6 +803,9 @@ public class SettingsActivity extends Activity {
                 playOptionsContent.setVisibility(View.VISIBLE);
                 playOptionsArrow.setText("▼");
             }
+            // 树结构变了：等下一帧布局完成后再允许移动焦点，
+            // 否则第一下方向键会拿新控件的旧坐标做就近搜索，表现为"跳到很后面"
+            navNeedsLayout = true;
             buildFocusableControlsList();
         });
 
@@ -758,6 +826,7 @@ public class SettingsActivity extends Activity {
                 inputOptionsContent.setVisibility(View.VISIBLE);
                 inputOptionsArrow.setText("▼");
             }
+            navNeedsLayout = true;
             buildFocusableControlsList();
         });
 
@@ -1010,6 +1079,8 @@ public class SettingsActivity extends Activity {
             }
             bmsPathContainer.addView(row);
         }
+        // 行被整体重建：等布局完成后再允许移动焦点（新行的坐标此时还无效）
+        navNeedsLayout = true;
         buildFocusableControlsList();
     }
 
@@ -1050,6 +1121,8 @@ public class SettingsActivity extends Activity {
             row.addView(editText); row.addView(updateBtn); row.addView(removeBtn);
             tableUrlContainer.addView(row);
         }
+        // 同上：行重建后先等一帧布局
+        navNeedsLayout = true;
         buildFocusableControlsList();
     }
 
@@ -1628,6 +1701,9 @@ public class SettingsActivity extends Activity {
         super.onResume();
         startKeepAlive();
         gamepadMode = false;
+        stopSeekRepeat();
+        stopNavRepeat();
+        adjustingSeekBar = null;
         readAllOptionsFromUI();
         saveConfigToJson();
     }
@@ -1639,6 +1715,18 @@ public class SettingsActivity extends Activity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        // 松开方向键即停连发（调整态调值 + 导航移动焦点都由软件连发驱动，
+        // 不依赖系统 key repeat —— 手柄十字键基本不上报自动重复）
+        if (event.getAction() == KeyEvent.ACTION_UP) {
+            int upCode = event.getKeyCode();
+            if (upCode == KeyEvent.KEYCODE_DPAD_LEFT || upCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                stopSeekRepeat();
+            }
+            if (upCode == KeyEvent.KEYCODE_DPAD_UP || upCode == KeyEvent.KEYCODE_DPAD_DOWN
+                    || upCode == KeyEvent.KEYCODE_DPAD_LEFT || upCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                stopNavRepeat();
+            }
+        }
         if (event.getAction() == KeyEvent.ACTION_DOWN) {
             int keyCode = event.getKeyCode();
             if (isGamepadKeyCode(keyCode)) {
@@ -1649,16 +1737,44 @@ public class SettingsActivity extends Activity {
                 lastGamepadInputTime = SystemClock.uptimeMillis();
             }
             if (gamepadMode) {
-                // 优先让系统处理 DPAD 事件，如果系统处理了（例如 Spinner 下拉框或者标准焦点切换），则不再执行自定义逻辑
-                if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN ||
-                    keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                    if (super.dispatchKeyEvent(event)) return true;
+                final View focused = getCurrentFocus();
+
+                // ── 滑块调整态 ──
+                // 先用 A 键"选中"滑块，才能用左右（或摇杆左右）调值；调整期间上下不移动焦点、
+                // 也不滚动；再按一次 A（或 B）退出调整态，回到可上下滚动的普通导航。
+                if (adjustingSeekBar != null) {
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) { startSeekRepeat(-1); return true; }
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) { startSeekRepeat(1); return true; }
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_UP || keyCode == KeyEvent.KEYCODE_DPAD_DOWN) {
+                        return true; // 调整期间吞掉上下，避免滚动 / 焦点跑走
+                    }
+                    if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_BUTTON_B) {
+                        exitSeekBarAdjust(); // 先退出调整，而不是直接离开设置界面
+                        return true;
+                    }
+                    if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_BUTTON_A
+                            || keyCode == KeyEvent.KEYCODE_ENTER) {
+                        exitSeekBarAdjust();
+                        return true;
+                    }
                 }
 
-                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) { moveFocus(MoveDirection.UP); return true; }
-                if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) { moveFocus(MoveDirection.DOWN); return true; }
-                if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) { moveFocus(MoveDirection.LEFT); return true; }
-                if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) { moveFocus(MoveDirection.RIGHT); return true; }
+                // 只有"数值类控件"（SeekBar / Spinner）的左右键用来改值，才先交给系统处理。
+                // 之前对四个方向键一律 `super.dispatchKeyEvent()` 优先，而这些控件会消费
+                // 上下/左右键（Spinner 展开、SeekBar 调值），导致焦点被吞掉、卡在控件里出不去 ——
+                // 这就是"某些选项怎么操作都到不了"的来源。
+                // 上下键现在一律由我们做焦点移动，保证任何控件都能上下离开。
+                // 滑块例外：未进入调整态时左右不做调值（必须先用 A 选中），只走焦点移动。
+                if ((keyCode == KeyEvent.KEYCODE_DPAD_LEFT || keyCode == KeyEvent.KEYCODE_DPAD_RIGHT)
+                        && isValueAdjustControl(focused) && !(focused instanceof android.widget.SeekBar)
+                        && super.dispatchKeyEvent(event)) {
+                    return true;
+                }
+
+                if (keyCode == KeyEvent.KEYCODE_DPAD_UP) { startNavRepeat(MoveDirection.UP); return true; }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_DOWN) { startNavRepeat(MoveDirection.DOWN); return true; }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_LEFT) { startNavRepeat(MoveDirection.LEFT); return true; }
+                if (keyCode == KeyEvent.KEYCODE_DPAD_RIGHT) { startNavRepeat(MoveDirection.RIGHT); return true; }
                 if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_BUTTON_B) {
                     readAllOptionsFromUI(); saveConfigToJson(); finish(); return true;
                 }
@@ -1668,6 +1784,148 @@ public class SettingsActivity extends Activity {
             }
         }
         return super.dispatchKeyEvent(event);
+    }
+
+    /** 左右键用于调值的控件（先让系统处理左右键；上下键仍由我们移动焦点） */
+    private boolean isValueAdjustControl(View view) {
+        return view instanceof android.widget.SeekBar || view instanceof android.widget.Spinner;
+    }
+
+    /**
+     * 调整滑块的数值（手柄左右键 / 摇杆左右）。
+     * 步长取量程的 2%（至少 1），`setProgress` 会触发已有的 OnSeekBarChangeListener 落值。
+     */
+    private void adjustSeekBar(int direction) {
+        final android.widget.SeekBar bar = adjustingSeekBar;
+        if (bar == null) {
+            return;
+        }
+        final int step = Math.max(1, Math.round(bar.getMax() / 50f));
+        final int next = Math.max(0, Math.min(bar.getMax(), bar.getProgress() + direction * step));
+        if (next != bar.getProgress()) {
+            bar.setProgress(next);
+        }
+    }
+
+    /**
+     * 按住左右键连续调整：立即调一步，并启动软件连发
+     * （首延 175ms，之后每 55ms 一步、连发 6 步后加速到 30ms —— 见 {@link #seekRepeatRunnable}）。
+     * 同方向已在连发中则忽略（键盘自动重复会连发多个 ACTION_DOWN，不能叠加）。
+     */
+    private void startSeekRepeat(int direction) {
+        if (seekRepeatDirection == direction && seekRepeatDirection != 0) {
+            return;
+        }
+        stopSeekRepeat();
+        seekRepeatDirection = direction;
+        seekRepeatCount = 0;
+        adjustSeekBar(direction);
+        seekRepeatHandler.postDelayed(seekRepeatRunnable, 175L);
+    }
+
+    /** 停止连发（松开按键 / 退出调整态 / 焦点离开滑块 / 切回触摸时都要调） */
+    private void stopSeekRepeat() {
+        seekRepeatDirection = 0;
+        seekRepeatCount = 0;
+        seekRepeatHandler.removeCallbacks(seekRepeatRunnable);
+    }
+
+    /**
+     * 按住方向键连续移动焦点：立即走一步，并启动软件连发
+     * （首延 200ms，之后每 80ms 一步、4 步后加速到 60ms —— 见 {@link #navRepeatRunnable}）。
+     * 同方向已在连发中则忽略（键盘自动重复的多个 ACTION_DOWN 不能叠加）。
+     * 摇杆导航不走这里 —— 摇杆是持续运动事件流，onGenericMotionEvent 里自带节流。
+     */
+    private void startNavRepeat(MoveDirection direction) {
+        if (navRepeatDirection == direction) {
+            return;
+        }
+        stopNavRepeat();
+        navRepeatDirection = direction;
+        navRepeatCount = 0;
+        moveFocus(direction);
+        navRepeatHandler.postDelayed(navRepeatRunnable, 200L);
+    }
+
+    /** 停止导航连发（松开方向键 / 切回触摸 / onResume 时都要调） */
+    private void stopNavRepeat() {
+        navRepeatDirection = null;
+        navRepeatCount = 0;
+        navRepeatHandler.removeCallbacks(navRepeatRunnable);
+    }
+
+    /** 退出滑块调整态（高光恢复成普通样式，上下滚动/焦点移动同时恢复） */
+    private void exitSeekBarAdjust() {
+        stopSeekRepeat();
+        if (adjustingSeekBar != null) {
+            adjustingSeekBar = null;
+            updateFocusIndicator(getCurrentFocus());
+        }
+    }
+
+    /**
+     * 摇杆（左/右摇杆轴）导航。
+     *
+     * <p>Android 上摇杆是 {@code AXIS_X/AXIS_Y} 运动事件，不会产生 KeyEvent，
+     * 之前只实现了 {@link #dispatchKeyEvent}，所以摇杆完全不能导航 ——
+     * 这是"某些选项怎么用摇杆都弄不到"的直接原因。部分手柄/映射模式把十字键
+     * 走 HAT 轴上报，这里也一并支持。</p>
+     *
+     * <p>过阈值才触发，并有重复间隔，避免漂移值导致焦点连跳。</p>
+     */
+    @Override
+    public boolean onGenericMotionEvent(android.view.MotionEvent event) {
+        final int source = event.getSource();
+        final boolean joystick = (source & android.view.InputDevice.SOURCE_JOYSTICK) == android.view.InputDevice.SOURCE_JOYSTICK
+                || (source & android.view.InputDevice.SOURCE_GAMEPAD) == android.view.InputDevice.SOURCE_GAMEPAD;
+        if (!joystick) {
+            return super.onGenericMotionEvent(event);
+        }
+
+        float x = event.getAxisValue(android.view.MotionEvent.AXIS_X);
+        float y = event.getAxisValue(android.view.MotionEvent.AXIS_Y);
+        final float hatX = event.getAxisValue(android.view.MotionEvent.AXIS_HAT_X);
+        final float hatY = event.getAxisValue(android.view.MotionEvent.AXIS_HAT_Y);
+        if (Math.abs(hatX) > Math.abs(x)) x = hatX;
+        if (Math.abs(hatY) > Math.abs(y)) y = hatY;
+
+        MoveDirection direction = null;
+        if (Math.abs(x) >= STICK_THRESHOLD || Math.abs(y) >= STICK_THRESHOLD) {
+            // 取偏离更大的那个轴，避免斜推时抖动
+            direction = Math.abs(x) > Math.abs(y)
+                    ? (x > 0 ? MoveDirection.RIGHT : MoveDirection.LEFT)
+                    : (y > 0 ? MoveDirection.DOWN : MoveDirection.UP);
+        }
+        if (direction == null) {
+            lastStickMoveTime = 0;
+            return super.onGenericMotionEvent(event);
+        }
+
+        if (!gamepadMode) {
+            gamepadMode = true;
+            updateTouchModeForGamepad();
+        }
+        final long now = SystemClock.uptimeMillis();
+        lastGamepadInputTime = now;
+
+        // 滑块调整态：只有水平轴调值，垂直轴一律忽略（不滚动、不移动焦点）。
+        // 节流用独立的 lastStickAdjustTime 且间隔更短（45ms）：摇杆事件流本身是连续的，
+        // 与十字键连发（55/30ms）的手感对齐。
+        if (adjustingSeekBar != null) {
+            if (direction == MoveDirection.LEFT || direction == MoveDirection.RIGHT) {
+                if (now - lastStickAdjustTime >= 45) {
+                    lastStickAdjustTime = now;
+                    adjustSeekBar(direction == MoveDirection.RIGHT ? 1 : -1);
+                }
+            }
+            return true;
+        }
+
+        if (now - lastStickMoveTime >= STICK_REPEAT_MS) {
+            lastStickMoveTime = now;
+            moveFocus(direction);
+        }
+        return true;
     }
 
     private enum MoveDirection { UP, DOWN, LEFT, RIGHT }
@@ -1681,6 +1939,27 @@ public class SettingsActivity extends Activity {
     }
 
     private void moveFocus(MoveDirection direction) {
+        // 展开/收起刚发生、布局还没走完：控件坐标还是旧值（未测量的甚至是 0），
+        // 此刻做几何就近搜索就会"莫名其妙跳到很后面"。推迟到布局完成后再执行。
+        if (navNeedsLayout) {
+            if (!navDeferred) {
+                navDeferred = true;
+                final Runnable deferredMove = () -> {
+                    if (!navNeedsLayout) return;   // 已由另一条路径执行过
+                    navNeedsLayout = false;
+                    navDeferred = false;
+                    moveFocus(direction);
+                };
+                afterNextLayout(settingsScrollView, deferredMove);
+                // 兜底：万一没有触发新的布局，也不能把这一下按键丢掉
+                if (settingsScrollView != null) {
+                    settingsScrollView.postDelayed(deferredMove, 32);
+                } else {
+                    deferredMove.run();
+                }
+            }
+            return;
+        }
         buildFocusableControlsList();
         View current = getCurrentFocus();
         if (current == null) {
@@ -1691,96 +1970,129 @@ public class SettingsActivity extends Activity {
             return;
         }
         int currentIndex = focusableControls.indexOf(current);
-        int nextIndex = -1;
-        switch (direction) {
-            case DOWN: nextIndex = findNextDown(current, currentIndex); break;
-            case UP: nextIndex = findPrevUp(current, currentIndex); break;
-            case RIGHT: nextIndex = findNextRight(current, currentIndex); break;
-            case LEFT: nextIndex = findPrevLeft(current, currentIndex); break;
-        }
-        if (nextIndex >= 0 && nextIndex < focusableControls.size()) {
+        // 逐个尝试候选：控件可能因 disabled / 已失效而拿不到焦点（requestFocus() 返回 false），
+        // 失败就把它剔掉、按次优目标重试。
+        // 典型场景：默认歌曲路径那一行的 EditText 被 setEnabled(false) 禁用，但它
+        // isFocusable() 仍为 true 会被选中 —— 一旦直接 requestFocus() 就静默失败，
+        // 表现就是"焦点卡在添加按钮上不再往下"。
+        for (int attempt = 0; attempt < 6; attempt++) {
+            currentIndex = focusableControls.indexOf(current);
+            int nextIndex = findNearestInDirection(current, currentIndex, direction);
+            if (nextIndex < 0 || nextIndex >= focusableControls.size()) {
+                return;
+            }
             View next = focusableControls.get(nextIndex);
-            next.requestFocus();
-            ensureViewVisible(next);
+            if (next == current) {
+                return; // 该方向已经没有更合适的目标
+            }
+            if (next.requestFocus()) {
+                ensureViewVisible(next);
+                return;
+            }
+            focusableControls.remove(nextIndex);
         }
     }
 
-    private int findNextDown(View current, int currentIndex) {
-        int bestIndex = -1; long bestScore = Long.MAX_VALUE;
-        int[] currLoc = new int[2]; current.getLocationOnScreen(currLoc);
-        int currentBottom = currLoc[1] + current.getHeight();
-        int currentCenterX = currLoc[0] + current.getWidth() / 2;
+    /**
+     * 按方向找最近的可聚焦控件。
+     *
+     * <p>打分沿用原来的"主方向距离 × 1000 + 次方向距离"，但**优先生效范围内可见的控件**：
+     * 原来纯几何比较会把"同方向但在滚动视口之外、甚至更靠后一屏"的控件选出来，
+     * 表现就是焦点乱飘。视口内没有候选时才退回原来的行为（否则滚不到底部的项）。</p>
+     */
+    private int findNearestInDirection(View current, int currentIndex, MoveDirection direction) {
+        int[] currLoc = new int[2];
+        current.getLocationOnScreen(currLoc);
+        final int currLeft = currLoc[0];
+        final int currTop = currLoc[1];
+        final int currRight = currLeft + current.getWidth();
+        final int currBottom = currTop + current.getHeight();
+        final int currCenterX = currLeft + current.getWidth() / 2;
+        final int currCenterY = currTop + current.getHeight() / 2;
+
+        // 滚动视口的屏幕矩形：只有和它有交集的控件才算"看得见"
+        int[] scrollLoc = new int[2];
+        int viewTop = 0, viewBottom = Integer.MAX_VALUE;
+        if (settingsScrollView != null) {
+            settingsScrollView.getLocationOnScreen(scrollLoc);
+            viewTop = scrollLoc[1];
+            viewBottom = scrollLoc[1] + settingsScrollView.getHeight();
+        }
+
+        int bestIndex = -1, fallbackIndex = -1;
+        long bestScore = Long.MAX_VALUE, fallbackScore = Long.MAX_VALUE;
         for (int i = 0; i < focusableControls.size(); i++) {
             if (i == currentIndex) continue;
             View v = focusableControls.get(i);
-            int[] vLoc = new int[2]; v.getLocationOnScreen(vLoc);
-            if (vLoc[1] <= currentBottom - 5) continue;
-            int vCenterX = vLoc[0] + v.getWidth() / 2;
-            int distX = Math.abs(vCenterX - currentCenterX);
-            int distY = vLoc[1] - currentBottom;
-            long score = (long) distY * 1000 + distX;
-            if (score < bestScore) { bestScore = score; bestIndex = i; }
+            int[] vLoc = new int[2];
+            v.getLocationOnScreen(vLoc);
+            final int vLeft = vLoc[0];
+            final int vTop = vLoc[1];
+            final int vRight = vLeft + v.getWidth();
+            final int vBottom = vTop + v.getHeight();
+
+            long score;
+            switch (direction) {
+                case DOWN:
+                    if (vTop <= currBottom - 5) continue;
+                    score = (long) (vTop - currBottom) * 1000 + Math.abs(vLeft + v.getWidth() / 2 - currCenterX);
+                    break;
+                case UP:
+                    if (vBottom >= currTop + 5) continue;
+                    score = (long) (currTop - vBottom) * 1000 + Math.abs(vLeft + v.getWidth() / 2 - currCenterX);
+                    break;
+                case RIGHT:
+                    if (vLeft <= currRight - 5) continue;
+                    score = (long) (vLeft - currRight) * 1000 + Math.abs(vTop + v.getHeight() / 2 - currCenterY);
+                    break;
+                default: // LEFT
+                    if (vRight >= currLeft + 5) continue;
+                    score = (long) (currLeft - vRight) * 1000 + Math.abs(vTop + v.getHeight() / 2 - currCenterY);
+                    break;
+            }
+
+            if (score < fallbackScore) { fallbackScore = score; fallbackIndex = i; }
+            final boolean inView = vBottom > viewTop + 5 && vTop < viewBottom - 5;
+            if (inView && score < bestScore) { bestScore = score; bestIndex = i; }
         }
-        return bestIndex >= 0 ? bestIndex : currentIndex;
+        if (bestIndex >= 0) {
+            return bestIndex;
+        }
+        return fallbackIndex >= 0 ? fallbackIndex : currentIndex;
     }
 
-    private int findPrevUp(View current, int currentIndex) {
-        int bestIndex = -1; long bestScore = Long.MAX_VALUE;
-        int[] currLoc = new int[2]; current.getLocationOnScreen(currLoc);
-        int currentTop = currLoc[1];
-        int currentCenterX = currLoc[0] + current.getWidth() / 2;
-        for (int i = 0; i < focusableControls.size(); i++) {
-            if (i == currentIndex) continue;
-            View v = focusableControls.get(i);
-            int[] vLoc = new int[2]; v.getLocationOnScreen(vLoc);
-            int vBottom = vLoc[1] + v.getHeight();
-            if (vBottom >= currentTop + 5) continue;
-            int vCenterX = vLoc[0] + v.getWidth() / 2;
-            int distX = Math.abs(vCenterX - currentCenterX);
-            int distY = currentTop - vBottom;
-            long score = (long) distY * 1000 + distX;
-            if (score < bestScore) { bestScore = score; bestIndex = i; }
+    /** 等下一帧布局完成后再执行（展开/收起后控件坐标才有效） */
+    private void afterNextLayout(View anchor, Runnable action) {
+        if (anchor == null || !anchor.getViewTreeObserver().isAlive()) {
+            action.run();
+            return;
         }
-        return bestIndex >= 0 ? bestIndex : currentIndex;
+        anchor.getViewTreeObserver().addOnGlobalLayoutListener(
+                new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                    @Override
+                    public void onGlobalLayout() {
+                        if (anchor.getViewTreeObserver().isAlive()) {
+                            anchor.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                        }
+                        action.run();
+                    }
+                });
     }
 
-    private int findNextRight(View current, int currentIndex) {
-        int bestIndex = -1; long bestScore = Long.MAX_VALUE;
-        int[] currLoc = new int[2]; current.getLocationOnScreen(currLoc);
-        int currentRight = currLoc[0] + current.getWidth();
-        int currentCenterY = currLoc[1] + current.getHeight() / 2;
-        for (int i = 0; i < focusableControls.size(); i++) {
-            if (i == currentIndex) continue;
-            View v = focusableControls.get(i);
-            int[] vLoc = new int[2]; v.getLocationOnScreen(vLoc);
-            if (vLoc[0] <= currentRight - 5) continue;
-            int vCenterY = vLoc[1] + v.getHeight() / 2;
-            int distY = Math.abs(vCenterY - currentCenterY);
-            int distX = vLoc[0] - currentRight;
-            long score = (long) distX * 1000 + distY;
-            if (score < bestScore) { bestScore = score; bestIndex = i; }
+    /** 取容器里第一个可聚焦且已布局的子控件（展开后用来确定性地落焦） */
+    private View findFirstFocusableChild(ViewGroup parent) {
+        for (int i = 0; i < parent.getChildCount(); i++) {
+            View child = parent.getChildAt(i);
+            if (child.getVisibility() != View.VISIBLE) continue;
+            if (child.isFocusable() && child.getWidth() > 0 && child.getHeight() > 0) {
+                return child;
+            }
+            if (child instanceof ViewGroup) {
+                View found = findFirstFocusableChild((ViewGroup) child);
+                if (found != null) return found;
+            }
         }
-        return bestIndex >= 0 ? bestIndex : currentIndex;
-    }
-
-    private int findPrevLeft(View current, int currentIndex) {
-        int bestIndex = -1; long bestScore = Long.MAX_VALUE;
-        int[] currLoc = new int[2]; current.getLocationOnScreen(currLoc);
-        int currentLeft = currLoc[0];
-        int currentCenterY = currLoc[1] + current.getHeight() / 2;
-        for (int i = 0; i < focusableControls.size(); i++) {
-            if (i == currentIndex) continue;
-            View v = focusableControls.get(i);
-            int[] vLoc = new int[2]; v.getLocationOnScreen(vLoc);
-            int vRight = vLoc[0] + v.getWidth();
-            if (vRight >= currentLeft + 5) continue;
-            int vCenterY = vLoc[1] + v.getHeight() / 2;
-            int distY = Math.abs(vCenterY - currentCenterY);
-            int distX = currentLeft - vRight;
-            long score = (long) distX * 1000 + distY;
-            if (score < bestScore) { bestScore = score; bestIndex = i; }
-        }
-        return bestIndex >= 0 ? bestIndex : currentIndex;
+        return null;
     }
 
     private void buildFocusableControlsList() {
@@ -1792,10 +2104,19 @@ public class SettingsActivity extends Activity {
     private void collectFocusableViews(ViewGroup parent) {
         for (int i = 0; i < parent.getChildCount(); i++) {
             View child = parent.getChildAt(i);
-            if (child.getVisibility() == View.VISIBLE) {
-                if (child.isFocusable() && !(child instanceof android.widget.ScrollView)) focusableControls.add(child);
-                if (child instanceof ViewGroup) collectFocusableViews((ViewGroup) child);
+            if (child.getVisibility() != View.VISIBLE) continue;
+            // 跳过还没测量/布局的控件：它们的屏幕坐标是 0（或折叠时的旧值），
+            // 参与几何就近搜索会把焦点"带到"错误目标上。
+            if (child.getWidth() <= 0 || child.getHeight() <= 0) continue;
+            // 跳过禁用的控件：它们 isFocusable() 仍为 true（Android 的 isFocusable()
+            // 不看 enabled），但 requestFocus() 一定失败 —— 放进候选池只会把焦点卡住。
+            // 注意仍要继续向下递归：容器被禁用不代表子控件都该被跳过。
+            // 跳过手柄高光指示器本身（它是后加的覆盖层）
+            if (child != focusIndicator && child.isEnabled()
+                    && child.isFocusable() && !(child instanceof android.widget.ScrollView)) {
+                focusableControls.add(child);
             }
+            if (child instanceof ViewGroup) collectFocusableViews((ViewGroup) child);
         }
     }
 
@@ -1820,10 +2141,22 @@ public class SettingsActivity extends Activity {
 
     private void activateCurrentFocus() {
         View focused = getCurrentFocus();
-        if (focused != null) {
-            focused.performClick();
-            if (focused instanceof EditText && gamepadMode) showCharacterWheelForEditText((EditText) focused);
+        if (focused == null) {
+            return;
         }
+        // 滑块：A 键在"进入调整态 / 退出调整态"之间切换。
+        // 进入后左右（或摇杆左右）才改值，上下被吞掉，不会滚走；高光也会加强。
+        if (focused instanceof android.widget.SeekBar) {
+            if (adjustingSeekBar == focused) {
+                exitSeekBarAdjust();
+            } else {
+                adjustingSeekBar = (android.widget.SeekBar) focused;
+                updateFocusIndicator(focused);
+            }
+            return;
+        }
+        focused.performClick();
+        if (focused instanceof EditText && gamepadMode) showCharacterWheelForEditText((EditText) focused);
     }
 
     private void updateTouchModeForGamepad() {
@@ -1847,11 +2180,13 @@ public class SettingsActivity extends Activity {
         }
         if (focusIndicator == null) {
             focusIndicator = new View(this);
-            focusIndicator.setBackgroundResource(R.drawable.focus_highlight);
             focusIndicator.setFocusable(false);
             focusIndicator.setClickable(false);
             ((ViewGroup) findViewById(android.R.id.content)).addView(focusIndicator);
         }
+        // 滑块处于调整态时用更亮、边框更粗的高光，提示"左右键现在是在调这个值"
+        focusIndicator.setBackgroundResource(focusedView == adjustingSeekBar
+                ? R.drawable.focus_highlight_active : R.drawable.focus_highlight);
         focusIndicator.setVisibility(View.VISIBLE);
         int[] loc = new int[2]; focusedView.getLocationInWindow(loc);
         int[] rootLoc = new int[2]; findViewById(android.R.id.content).getLocationInWindow(rootLoc);

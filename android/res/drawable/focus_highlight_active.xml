@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 手柄高光（调整态）：用 A 键"选中"滑块后，高光比普通态更亮、边框更粗，
+     提示"现在左右/摇杆左右是在调这个值"。普通态见 focus_highlight.xml -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#994FC3F7" />
+    <stroke
+        android:width="3dp"
+        android:color="#4FC3F7" />
+    <corners android:radius="4dp" />
+</shape>

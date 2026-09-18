@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Spinner 下拉项的背景：默认全透明，让系统/主题的 list selector（当前行高光）能透出来；
+     同时把聚焦 / 按下 / 选中 / 激活 这些状态也映射到同一份高光，
+     这样无论框架走的是"列表 selector"还是"项自身状态"，用户都能看到光标落在哪一项。 -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_pressed="true" android:drawable="@drawable/list_selector_highlight" />
+    <item android:state_focused="true" android:drawable="@drawable/list_selector_highlight" />
+    <item android:state_selected="true" android:drawable="@drawable/list_selector_highlight" />
+    <item android:state_activated="true" android:drawable="@drawable/list_selector_highlight" />
+    <item android:drawable="@android:color/transparent" />
+</selector>

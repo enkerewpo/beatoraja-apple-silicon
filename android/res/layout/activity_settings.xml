@@ -237,6 +237,7 @@
             </LinearLayout>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/playerSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -480,6 +481,7 @@
             </LinearLayout>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/audioVisualizationModeSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -503,6 +505,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/floatingMenuPositionSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -526,6 +529,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/bgaDisplaySpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -549,6 +553,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/bgaExpandSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -588,6 +593,7 @@
             </LinearLayout>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/gaugeAutoShiftSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -624,6 +630,7 @@
                     android:gravity="center"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/autoSaveReplay1"
                     android:layout_width="0dp"
                     android:layout_height="@dimen/control_height_small"
@@ -646,6 +653,7 @@
                     android:gravity="center"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/autoSaveReplay2"
                     android:layout_width="0dp"
                     android:layout_height="@dimen/control_height_small"
@@ -668,6 +676,7 @@
                     android:gravity="center"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/autoSaveReplay3"
                     android:layout_width="0dp"
                     android:layout_height="@dimen/control_height_small"
@@ -690,6 +699,7 @@
                     android:gravity="center"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/autoSaveReplay4"
                     android:layout_width="0dp"
                     android:layout_height="@dimen/control_height_small"
@@ -760,6 +770,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/targetScoreSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -783,6 +794,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/gaugeTypeSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -882,6 +894,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/noteModifierSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -906,6 +919,7 @@
                 android:gravity="center_vertical"/>
 
             <Spinner
+                android:popupBackground="#F2333333"
                 android:id="@+id/hispeedFixSpinner"
                 android:layout_width="@dimen/spinner_width"
                 android:layout_height="@dimen/control_height"
@@ -1215,6 +1229,7 @@
                     android:textSize="@dimen/text_size_body"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/analogScratchAlgorithmSpinner"
                     android:layout_width="@dimen/spinner_width"
                     android:layout_height="@dimen/control_height"
@@ -1322,6 +1337,7 @@
                     android:textSize="@dimen/text_size_body"/>
 
                 <Spinner
+                    android:popupBackground="#F2333333"
                     android:id="@+id/mouseScratchAlgorithmSpinner"
                     android:layout_width="@dimen/spinner_width"
                     android:layout_height="@dimen/control_height"
