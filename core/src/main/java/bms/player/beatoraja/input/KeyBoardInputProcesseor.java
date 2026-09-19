@@ -147,6 +147,7 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 		Arrays.fill(keytime, Long.MIN_VALUE);
 		Arrays.fill(keymodifiers, 0);
 		Arrays.fill(pendingPressDeadline, 0); // 清理模拟按键保护，防止跨场次卡死
+		Arrays.fill(simulatedKeyNotified, false); // 跨场次不残留"已通知核心层"标记
 		lastPressedKey = -1;
 		mouseScratchInput.clear();
 	}
@@ -493,6 +494,14 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 	private static final long SIMULATED_KEY_DURATION = 150000; // 150ms (microseconds)
 
 	/**
+	 * 记录某 keycode 是否已因"模拟长按"向核心层发过 keyChanged(true)。
+	 * 释放时据此补发 keyChanged(false)：核心层 keystate 是电平语义，
+	 * 丢一次释放就会把槽位永久留在 true（游戏里表现为按键常亮、
+	 * 且只能重新按一下物理键才复位）。
+	 */
+	private final boolean[] simulatedKeyNotified = new boolean[256];
+
+	/**
 	 * キー押下をシミュレート。
 	 * keystate/keytimeを直接設定し、deadlineを記録。
 	 * poll()ControlKeysループはdeadline期限内のキーを上書きしない。
@@ -513,33 +522,48 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 			now = System.nanoTime() / 1000;
 		}
 
-		// 改进：如果 pressed 为 true 且之前状态不一致才更新；释放时（pressed=false）始终重置状态
-		if (!keystate[keycode] || pressed) {
-			keystate[keycode] = pressed;
-			keytime[keycode] = pressed ? now : Long.MIN_VALUE;
+		keystate[keycode] = pressed;
+		keytime[keycode] = pressed ? now : Long.MIN_VALUE;
 
-			// 注意：严禁在这里按 keycode 写核心层（历史代码曾写
-			// setKeyState(keycode, pressed)）——核心层是"槽位"索引空间，keycode 是
-			// 物理键值空间，两者在数字键区域重叠（NUM_0=7 恰好是 7K 的 F-SCR 槽位），
-			// 模拟数字键会被当成 scratch 长按写入核心层。轨道传播只走下方
-			// keyChanged 循环（按槽位），与 poll() 的路径一致。
+		// 注意：严禁按 keycode 写核心层（历史代码曾写 setKeyState(keycode, pressed)）——
+		// 核心层是"槽位"索引空间，keycode 是物理键值空间，两者在数字键区域重叠
+		// （NUM_0=7 恰好是 7K 的 F-SCR 槽位）。轨道传播只走 notifyLaneKeyChanged（按槽位），
+		// 与 poll() 的路径一致。
 
-			// 触发 keyChanged
-			for (int i = 0; i < keys.length; i++) {
-				if (keys[i] == keycode) {
-					this.bmsPlayerInputProcessor.keyChanged(this, now, i, pressed);
-					this.bmsPlayerInputProcessor.setAnalogState(i, false, 0);
-					break;
-				}
+		// 轨道传播：按下与释放各发一次 keyChanged（重复按下不重发，避免污染 keylog/replay）
+		if (pressed) {
+			// 长按锁定：poll() 的物理检测在此期间不覆盖该键
+			pendingPressDeadline[keycode] = Long.MAX_VALUE;
+			if (!simulatedKeyNotified[keycode]) {
+				simulatedKeyNotified[keycode] = true;
+				notifyLaneKeyChanged(keycode, true, now);
+			}
+		} else {
+			pendingPressDeadline[keycode] = 0;
+			// 释放必须补发 keyChanged(false)：核心层是电平语义，丢一次释放就会把槽位
+			// 永久留在 true —— 现象是"按过的键在游戏里常亮，只能重新按一下物理键才复位"。
+			// 历史实现把 keyChanged 放在"状态变化"分支内，pressed=false 永远进不去，
+			// 释放从来没有发出去过（例如长按 PLAYOPTION1 = 模拟 NUM5 按下，
+			// 若 NUM5 被绑到某条轨道，该轨道就会一路亮到下一场）。
+			if (simulatedKeyNotified[keycode]) {
+				simulatedKeyNotified[keycode] = false;
+				notifyLaneKeyChanged(keycode, false, now);
 			}
 		}
-		// release（pressed=false）时无条件清 keystate，防止粘滞
-		if (!pressed) {
-			keystate[keycode] = false;
-			keytime[keycode] = Long.MIN_VALUE;
-			pendingPressDeadline[keycode] = 0;
-		} else {
-			pendingPressDeadline[keycode] = Long.MAX_VALUE;
+	}
+
+	/**
+	 * 把模拟按键的按下/释放同步到核心层（只匹配"单键绑定且键值相同"的槽位）。
+	 * 必须按下与释放成对发送，见 {@link #setSimulatedKeyState}。
+	 */
+	private void notifyLaneKeyChanged(int keycode, boolean pressed, long now) {
+		if (this.bmsPlayerInputProcessor == null) return;
+		for (int i = 0; i < keys.length; i++) {
+			if (keys[i] == keycode) {
+				this.bmsPlayerInputProcessor.keyChanged(this, now, i, pressed);
+				this.bmsPlayerInputProcessor.setAnalogState(i, false, 0);
+				break;
+			}
 		}
 	}
 

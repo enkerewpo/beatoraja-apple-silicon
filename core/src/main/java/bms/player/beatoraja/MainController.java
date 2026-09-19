@@ -388,7 +388,7 @@ public class MainController {
             updateMainStateListener(0);
         }
 
-        // Android RESULT界面触摸转ESCAPE - 覆盖其他处理器
+        // Android RESULT界面触摸转ESCAPE（同时保留浮动菜单：点图标弹按键覆盖层，其余触摸退出结果界面）
         if (isAndroid && (state == MainStateType.RESULT || state == MainStateType.COURSERESULT)) {
             final com.badlogic.gdx.InputProcessor escapeMapper = new com.badlogic.gdx.InputProcessor() {
                 private long lastTouchTime = 0;
@@ -419,7 +419,22 @@ public class MainController {
                 @Override public boolean mouseMoved(int screenX, int screenY) { return false; }
                 @Override public boolean scrolled(float amountX, float amountY) { return false; }
             };
-            Gdx.input.setInputProcessor(escapeMapper);
+            // RESULT/COURSERESULT 也要浮动菜单：图标常驻，点击图标<b>不展开菜单面板</b>，
+            // 直接弹出"7K 键 + scratch"覆盖层（见 FloatingMenu#setResultMode）。
+            // 触摸事件先给浮动菜单（命中图标或覆盖层则消费），未命中的触摸再落到
+            // escapeMapper → ESCAPE，保持原有的"点一下退出结果界面"行为。
+            if (floatingMenu != null) {
+                floatingMenu.setVisible(true);
+                floatingMenu.setSelectMode(false);
+                floatingMenu.setKeyConfigMode(false);
+                floatingMenu.setSkinSelectMode(false);
+                floatingMenu.setPlayMode(false);
+                floatingMenu.setPracticeMode(false);
+                floatingMenu.setResultMode(true);
+                Gdx.input.setInputProcessor(new InputMultiplexer(floatingMenu, escapeMapper));
+            } else {
+                Gdx.input.setInputProcessor(escapeMapper);
+            }
         } else {
             // 浮动菜单：在 PLAY / DECIDE / MUSICPLAYER 状态隐藏（除非 config 允许在 PLAY 显示）
             if (floatingMenu != null) {
@@ -445,6 +460,8 @@ public class MainController {
                 floatingMenu.setSkinSelectMode(state == MainStateType.SKINCONFIG);
                 floatingMenu.setPlayMode(state == MainStateType.PLAY);
                 floatingMenu.setPracticeMode(practicePlay);
+                // 非 RESULT 状态：确保结果界面的"图标直出按键覆盖层"模式已退出
+                floatingMenu.setResultMode(false);
             }
             // 将 FloatingMenu 作为最高优先级处理器加入 InputMultiplexer
             if (current != null && current.getStage() != null) {
@@ -678,10 +695,51 @@ public class MainController {
      */
     private long nextFrameTimeNanos = 0;
 
+    // ─── 帧限制器调参（纳秒）───
+    /**
+     * 提交前置量上限：在目标时刻【之前】醒来，而不是"准点"醒来。
+     *
+     * <p>唤醒过冲与 swap 提交开销都由这段余量吸收，不再直接暴露在合成截止时间上：
+     * nanosleep / parkNanos 的语义是"不早于"，低端机在限频/深 idle 下实测过冲 0.3~2ms，
+     * 且偏差单向（只会晚、不会早）。旧实现在 Android 上跳过忙等 → 每帧都以 T+ε 提交，
+     * 余量为 0；一旦越过合成截止时间就是丢一整帧。</p>
+     *
+     * <p>提前提交同时也是【降低】呈现延迟的方向（缓冲更早入队、更可能赶上本次合成）。</p>
+     *
+     * <p>实际取值还会被 clamp 到 frameInterval/4，保证高刷下前置量不喧宾夺主。</p>
+     */
+    private static final long SUBMIT_LEAD_MAX_NANOS = 2_000_000L;
+
+    /**
+     * 末尾忙等时长：保证"绝不晚于目标时刻"（唤醒时刻确定化）。
+     * 成本：250µs / 16.67ms ≈ 单核 1.5%（60Hz）；120Hz 帧周期 8.33ms ≈ 3%。
+     * 若实测 CPU 有压力可置 0 — 此时由 SUBMIT_LEAD 独自兜底（前置量本身已能吸收过冲）。
+     */
+    private static final long BUSY_WAIT_TAIL_NANOS = 250_000L;
+
+    /** parkNanos 步长下限：越接近目标步长越小，压小最后一次 park 的过冲幅度 */
+    private static final long PARK_SLICE_MIN_NANOS = 200_000L;
+
+    /**
+     * 相位纠正上限：每帧最多把目标时刻往回拉这么多，且【只往回拉】。
+     *
+     * <p>修正的是"应用周期(1e9/maxFPS) ≠ 面板真实周期"造成的相位漂移，典型 10~20µs/帧；
+     * 不修的话每一帧都往后滑一点，约 20s 漂满一个周期 —— 提交时刻越过合成截止时间，
+     * 丢一整帧，表现就是周期性微卡顿。</p>
+     *
+     * <p>有上限 ⇒ vsync 时间戳抖动/滞后最多造成 250µs 偏差，绝不会把提交推晚。</p>
+     */
+    private static final long PHASE_FIX_MAX_NANOS = 250_000L;
+
     /** 记录来自 Android Choreographer 的最新 VSync 时间戳（纳秒） */
     private static volatile long lastVsyncTimeNanos = 0;
+    /** 记录上面那个时间戳被写入的时刻（纳秒），用于判断其新鲜度 */
+    private static volatile long lastVsyncRecordNanos = 0;
     /** 供 AndroidLauncher 调用，同步 VSync 相位 */
-    public static void setLastVsyncTimeNanos(long time) { lastVsyncTimeNanos = time; }
+    public static void setLastVsyncTimeNanos(long time) {
+        lastVsyncRecordNanos = System.nanoTime(); // 先记写入时刻
+        lastVsyncTimeNanos = time;                // 再写时间戳（作为发布动作）
+    }
 
     // ─── 等比视口参数 ───
     // Android 端屏幕宽高比通常不是 16:9（如 2400x1080 = 20:9），
@@ -1005,44 +1063,68 @@ public class MainController {
             final long frameIntervalNanos = 1_000_000_000L / maxFPS;
             final long now = System.nanoTime();
 
-            // 初始化或重置：若 nextFrameTimeNanos 距现在已超过 3 个帧周期，
-            // 说明是首次运行或长时间卡顿后恢复，重新对齐到当前时间
-            if (nextFrameTimeNanos == 0 || now - nextFrameTimeNanos > frameIntervalNanos * 3) {
+            // 初始化：首次运行从下一个帧周期开始
+            // 落后重锚：卡顿超过 3 个周期后，直接对齐到【现在】而不是"现在 + 一个周期"。
+            //   旧写法会额外白等一个空周期，把一次卡顿放大成"卡顿 + 一帧空白"；
+            //   对齐到现在则允许立即补帧（catch-up）。落后不超过 3 个周期时保持落后，
+            //   由后面的 remaining <= 0 自然跳过睡眠、逐帧追平。
+            if (nextFrameTimeNanos == 0) {
                 nextFrameTimeNanos = now + frameIntervalNanos;
             } else {
                 nextFrameTimeNanos += frameIntervalNanos;
+                if (now - nextFrameTimeNanos > frameIntervalNanos * 3) {
+                    nextFrameTimeNanos = now;
+                }
             }
 
-            // ─── Android VSync 相位对齐 ───
-            // 将 nextFrameTimeNanos 对齐到来自 Choreographer 的 VSync 信号相位。
-            // 这样应用提交帧的节奏与 SurfaceFlinger 合成节奏保持锁定，消除周期性微卡顿。
-            if (isAndroid && lastVsyncTimeNanos != 0) {
-                long diff = nextFrameTimeNanos - lastVsyncTimeNanos;
-                long intervals = Math.round((double) diff / frameIntervalNanos);
-                nextFrameTimeNanos = lastVsyncTimeNanos + intervals * frameIntervalNanos;
+            // ─── VSync 相位纠正（只往回拉 + 限量）───
+            // 旧实现是"就地取整到 vsync 网格"：一次最多 ±半个周期的硬跳变
+            //   （60Hz = ±8.3ms，120Hz = ±4.2ms），比它想消除的漂移大两个数量级；
+            //   而且用的 lastVsyncTimeNanos 由 UI 线程 Choreographer 回调写、GL 线程只读，
+            //   4×A7 上 UI 线程被抢占时该时间戳会滞后好几帧。
+            // 现在：① 时间戳超过 2 个帧周期就不采信；② 即使采信，也只做"往回拉 250µs"的
+            //   限速纠正。漂移量级 10~20µs/帧 ⇒ 每帧都被完全抵消，且任何坏输入都无法把
+            //   提交时刻推晚。
+            if (isAndroid && lastVsyncTimeNanos != 0
+                    && now - lastVsyncRecordNanos <= frameIntervalNanos * 2) {
+                final long diff = nextFrameTimeNanos - lastVsyncTimeNanos;
+                final long snapped = lastVsyncTimeNanos
+                        + Math.round((double) diff / frameIntervalNanos) * frameIntervalNanos;
+                final long late = nextFrameTimeNanos - snapped;
+                if (late > 0) {
+                    nextFrameTimeNanos -= Math.min(late, PHASE_FIX_MAX_NANOS);
+                }
             }
 
-            long remaining = nextFrameTimeNanos - System.nanoTime();
+            // 实际等待目标 = 计划时刻 − 提交前置量（提前醒来，把最后一段交给 eglSwapBuffers）
+            final long waitTarget = nextFrameTimeNanos
+                    - Math.min(SUBMIT_LEAD_MAX_NANOS, frameIntervalNanos / 4);
 
-            // 第一阶段：较长等待用 sleep 节省 CPU（保留 1ms 缓冲给后两阶段）
-            if (remaining > 2_000_000) {
+            final long remaining = waitTarget - System.nanoTime();
+
+            // 第一阶段：较长等待用 sleep 节省 CPU（给后两阶段留 2ms 缓冲）
+            if (remaining > 3_000_000L) {
                 try {
-                    Thread.sleep((remaining - 1_000_000) / 1_000_000);
+                    Thread.sleep((remaining - 2_000_000L) / 1_000_000L);
                 } catch (InterruptedException e) {
                     // Ignore
                 }
             }
 
-            // 第二阶段：剩余 1ms 内用 parkNanos 微秒级睡眠，真正让出 CPU
-            while (nextFrameTimeNanos - System.nanoTime() > 200_000) {
-                LockSupport.parkNanos(200_000);
+            // 第二阶段：parkNanos 微秒级睡眠，步长随剩余量收缩（1ms → 500µs → 200µs）。
+            // 真正让出 CPU 的同时，把最后一次 park 的过冲幅度压到最小。
+            long left = waitTarget - System.nanoTime();
+            while (left > BUSY_WAIT_TAIL_NANOS) {
+                final long slice = left > 4_000_000L ? 1_000_000L
+                        : (left > 1_000_000L ? 500_000L : PARK_SLICE_MIN_NANOS);
+                LockSupport.parkNanos(slice);
+                left = waitTarget - System.nanoTime();
             }
 
-            // 第三阶段：最后 200µs 用忙等保证精度（Android 跳过）
-            if (!isAndroid) {
-                while (System.nanoTime() < nextFrameTimeNanos) {
-                    // busy-wait for precision
-                }
+            // 第三阶段：末尾忙等，保证唤醒时刻确定且绝不晚于目标。
+            // Android 上也执行（旧实现这里被 !isAndroid 跳过 → 过冲全额转嫁到提交时刻）。
+            while (System.nanoTime() < waitTarget) {
+                // busy-wait for precision
             }
         }
     }

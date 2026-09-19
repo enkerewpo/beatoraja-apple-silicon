@@ -57,6 +57,12 @@ public class FloatingMenu implements InputProcessor {
     private boolean practiceMode = false;
     /** Practice 模式下浮动图标的绘制不透明度（30%，常驻但不抢视线） */
     private static final float PRACTICE_ICON_ALPHA = 0.3f;
+    /**
+     * RESULT / COURSERESULT 界面模式：浮动图标点击后<b>不展开菜单面板</b>，
+     * 而是直接弹出 7K 键位覆盖层（{@link #openDirectKeyOverlay()}），
+     * 覆盖层摆放跟随浮动图标位置（与菜单面板同规则）。由 MainController 在状态切换时设置。
+     */
+    private boolean resultMode = false;
     /** Play 模式时：距上次交互超过此时间则自动隐藏图标（秒） */
     private static final float HIDE_DELAY = 0f;
     /** Play 模式时：距上次交互已过时间（秒） */
@@ -197,9 +203,12 @@ public class FloatingMenu implements InputProcessor {
     /** 标记是否刚通过图标点击展开了菜单，用于在 touchUp 时忽略图标区域的抬起事件 */
     private boolean justExpandedByIcon = false;
 
-    // ─── NUM5 长按模式（7K 覆盖层） ───
-    /** 长按模式类型：NONE=未激活，NUM5=模拟 NUM5 长按，START=模拟 START 长按 */
-    private enum HoldKeyType { NONE, NUM5, START }
+    // ─── 按键覆盖层（7K 键 1~7） ───
+    /**
+     * 覆盖层模式：NONE=未激活，NUM5=模拟 NUM5 长按，START=模拟 START 长按，
+     * DIRECT=结果界面直接打开（不模拟任何长按键，只需点击图标）。
+     */
+    private enum HoldKeyType { NONE, NUM5, START, DIRECT }
     /** 当前正在长按模拟的按键类型 */
     private HoldKeyType holdKeyType = HoldKeyType.NONE;
     /** 是否处于长按状态（按下未释放），决定 7K 覆盖层是否显示 */
@@ -208,9 +217,15 @@ public class FloatingMenu implements InputProcessor {
     private static final int[] SEVEN_KEYS_KEYCODES_DEFAULT = {
         Keys.Z, Keys.S, Keys.X, Keys.D, Keys.C, Keys.F, Keys.V
     };
-    /** 缓存 7K 各键显示名称，避免每帧 Keys.toString 分配 String 触发 GC 压力 */
-    private final String[] cached7KKeyNames = new String[7];
-    /** 缓存 7K 各键当前 keycode（-1 表示未初始化），用于检测配置变更以刷新名称 */
+    /**
+     * 覆盖层按钮数 = 7 个键，按钮索引 i 直接就是核心层 key index（键 i+1 → 槽位 i）。
+     * 曾额外在最左加过一个 scratch 按钮，已回退：PLAYOPTION 的调整用不到它，
+     * 且多余的槽位映射（scratch = 槽位 7）容易与数字键绑定的坑混淆。
+     */
+    private static final int K7_BUTTON_COUNT = 7;
+    /** 缓存覆盖层各按钮显示名称（[0..6] = 键 1..7），避免每帧 Keys.toString 分配 String 触发 GC 压力 */
+    private final String[] cached7KKeyNames = new String[K7_BUTTON_COUNT];
+    /** 缓存覆盖层各按钮当前 keycode（-1 表示未初始化），用于检测配置变更以刷新名称 */
     private final int[] cached7KKeycodes = new int[] {-1, -1, -1, -1, -1, -1, -1};
     /** 覆盖层整体目标占比（屏幕短边），用于按屏幕尺寸自适应 */
     private static final float K7_TARGET_SCREEN_RATIO = 0.30f;
@@ -259,13 +274,17 @@ public class FloatingMenu implements InputProcessor {
         }
     }
 
-    private void updateIconPosition() {
+    /** 浮动菜单位置配置：0=上中 1=上右 2=下中 3=下右（读取失败时回退 0） */
+    private int floatingMenuPosition() {
         Config config = null;
         if (kbInput != null && kbInput.getMainController() instanceof MainController) {
             config = ((MainController) kbInput.getMainController()).getConfig();
         }
+        return (config != null) ? config.getFloatingMenuPosition() : 0;
+    }
 
-        int pos = (config != null) ? config.getFloatingMenuPosition() : 0;
+    private void updateIconPosition() {
+        int pos = floatingMenuPosition();
         switch (pos) {
             case 1: // Top Right
                 iconX = logicW - ICON_SIZE - ICON_MARGIN;
@@ -288,14 +307,52 @@ public class FloatingMenu implements InputProcessor {
 
     /** PLAY 状态时调用 setVisible(false) 隐藏 */
     public void setVisible(boolean v) {
+        // 界面切走（或菜单被隐藏）时收尾：把仍"按着"的模拟按键释放掉。
+        // 触摸事件不会再来（touchUp 不再到达），不释放就会把核心层槽位留在 true。
+        if (!v && visible) {
+            releaseStuckPresses();
+        }
         this.visible = v;
         // 移除 if (!v) expanded = false; 以保持展开状态
+    }
+
+    /**
+     * 界面切换时的收尾：释放所有"只按下、没抬起"的模拟按键。
+     *
+     * <p>这是个容易漏的坑：按下走 touchDown（立即发 keyChanged(true)），释放走 touchUp——
+     * 一旦界面被切走，touchUp 永远不会到来，核心层槽位就永久留在 true，
+     * 表现为"进入下一界面后某个 lane 一直亮着，必须重新按一下对应物理键才复位"。</p>
+     */
+    private void releaseStuckPresses() {
+        // 1) 覆盖层（NUM5/START 长按）及其内部按住的 7K 键
+        if (holdKeyHeld) {
+            releaseHoldKey();
+        }
+        // 2) 展开面板里按住尚未抬起的菜单项
+        for (int p = 0; p < pointerPressedIndex.length; p++) {
+            int idx = pointerPressedIndex[p];
+            if (idx >= 0 && idx < items.length && kbInput != null) {
+                // 内部带 keycode 范围校验，伪 keycode（-100/-130 等）会被安全忽略
+                kbInput.setSimulatedKeyState(items[idx].keycode, false);
+            }
+            pointerPressedIndex[p] = -1;
+            pointer7KKey[p] = -1;
+            if (p < pointerConsuming.length) {
+                pointerConsuming[p] = false;
+            }
+        }
     }
 
     public boolean isVisible() { return visible; }
 
     /** 设置是否为 Select 界面（影响按钮过滤） */
     public void setSelectMode(boolean selectMode) {
+        // 离开选曲界面（进入 PLAY/RESULT 等）时收尾。必须放在这里：PLAY 下浮动菜单
+        // 往往仍然 visible（showFloatingMenuInPlay 默认开），setVisible 不会触发，
+        // 覆盖层按着没抬起的 PLAYOPTION 按键就会一路带进 play（某个 lane 常亮）。
+        if (this.selectMode && !selectMode) {
+            releaseStuckPresses();
+        }
         this.selectMode = selectMode;
         currentPage = 0; // 切换模式时重置页码
     }
@@ -335,6 +392,35 @@ public class FloatingMenu implements InputProcessor {
             sinceLastInteraction = 0f;
             playIconHidden = false;
         }
+    }
+
+    /**
+     * 设置是否为 RESULT / COURSERESULT 界面。
+     * <p>为 true 时：图标点击<b>不展开菜单面板</b>，直接弹出按键覆盖层
+     * （7K 键 1~7，供结果界面的 CHANGE_GRAPH / REPLAY_* / OK 等键位使用）。
+     * <p>为 false 时（离开结果界面）：关闭可能还开着的覆盖层并释放按住的键，
+     * 避免模拟按键残留在选曲界面。
+     */
+    public void setResultMode(boolean resultMode) {
+        this.resultMode = resultMode;
+        if (resultMode) {
+            // 结果界面不显示菜单面板：收起残留的展开状态与频谱调整页
+            if (spectrumAdjustOpen) exitSpectrumAdjust();
+            expanded = false;
+        } else if (holdKeyType == HoldKeyType.DIRECT) {
+            releaseHoldKey();
+        }
+    }
+
+    /** 结果界面直接打开按键覆盖层：无需长按 NUM5/START，点击图标即可 */
+    private void openDirectKeyOverlay() {
+        holdKeyHeld = true;
+        holdKeyType = HoldKeyType.DIRECT;
+        expanded = false;
+        // 立刻算一次布局：否则"图标按下"与"按键按下"落在同一帧时，
+        // 命中判定会用上一帧（甚至是别的界面）的旧布局
+        calculate7KOverlayLayout();
+        Gdx.app.log("FloatingMenu", "result key overlay: open (7KEYS)");
     }
 
     /** 判断按钮是否在当前界面显示 */
@@ -786,8 +872,10 @@ public class FloatingMenu implements InputProcessor {
     private float k7BtnW, k7BtnH;
     private float k7PanelX, k7PanelY;
     private float k7TitleY, k7CloseY;
+    /** 覆盖层块的水平中心（标题与关闭按钮据此居中；结果界面下会偏离屏幕中心） */
+    private float k7CenterX;
 
-    /** 计算 7K 覆盖层布局：整体高度约屏幕高度的 K7_TARGET_SCREEN_RATIO */
+    /** 计算按键覆盖层布局：整体高度约屏幕高度的 K7_TARGET_SCREEN_RATIO */
     private void calculate7KOverlayLayout() {
         // 总垂直空间 = 标题 + 间距 + 按钮 + 间距 + 关闭按钮
         float totalH = K7_TITLE_H + 12 + K7_CLOSE_H + 12;
@@ -795,29 +883,59 @@ public class FloatingMenu implements InputProcessor {
         float targetH = logicH * K7_TARGET_SCREEN_RATIO;
         k7BtnH = Math.max(60, targetH - totalH);
 
-        // 按钮宽度：让 7 个按钮 + 6 个间隙居中后占屏幕宽度 ~50%
+        // 按钮宽度：7 个键 + 6 个间隙，整体占屏幕宽度 ~55%
         float maxTotalW = logicW * 0.55f;
-        k7BtnW = (maxTotalW - 6 * K7_BTN_GAP) / 7f;
+        k7BtnW = (maxTotalW - (K7_BUTTON_COUNT - 1) * K7_BTN_GAP) / K7_BUTTON_COUNT;
         k7BtnW = Math.max(60, Math.min(k7BtnW, 140));
 
-        float totalW = 7 * k7BtnW + 6 * K7_BTN_GAP;
-        k7PanelX = (logicW - totalW) / 2f;
-        // 让 title + buttons + close 三段整体居中
+        float totalW = K7_BUTTON_COUNT * k7BtnW + (K7_BUTTON_COUNT - 1) * K7_BTN_GAP;
         float blockH = K7_TITLE_H + 12 + k7BtnH + 12 + K7_CLOSE_H;
-        float blockTop = (logicH + blockH) / 2f;
+
+        float blockX;
+        float blockTop;
+        if (holdKeyType == HoldKeyType.DIRECT) {
+            // 结果界面直接打开的覆盖层：跟随浮动图标摆放（与菜单面板同一套锚定规则）
+            blockX = anchoredOverlayX(totalW);
+            blockTop = anchoredOverlayTop(blockH);
+        } else {
+            // PLAYOPTION 1/2 的覆盖层：维持原有的屏幕居中
+            blockX = (logicW - totalW) / 2f;
+            blockTop = (logicH + blockH) / 2f;
+        }
+
+        k7PanelX = blockX;
+        k7CenterX = blockX + totalW / 2f;
         k7TitleY = blockTop - K7_TITLE_H;
         k7PanelY = k7TitleY - 12 - k7BtnH;
         k7CloseY = k7PanelY - 12 - K7_CLOSE_H;
     }
 
-    /** 检测触摸是否在 7K 覆盖层的某个键上，返回 0~6 的键索引，否则返回 -1
-     * @param stickyKey 当前已按下的键索引（-1 表示无），用于"粘住"避免手指抖动时释放按键 */
+    /** 覆盖层左边缘（锚定到浮动图标，规则与 {@link #anchorPanel} 一致，含屏幕边界保护） */
+    private float anchoredOverlayX(float w) {
+        int pos = floatingMenuPosition();
+        float x = (pos == 1 || pos == 3) ? iconX + ICON_SIZE - w : iconX + (ICON_SIZE - w) / 2f;
+        if (x < 10) x = 10;
+        if (x + w > logicW - 10) x = logicW - w - 10;
+        return x;
+    }
+
+    /** 覆盖层顶边 y 坐标（底部图标向上弹出，顶部图标向下弹出，含屏幕边界保护） */
+    private float anchoredOverlayTop(float h) {
+        int pos = floatingMenuPosition();
+        float top = (pos >= 2) ? (iconY + ICON_SIZE + 8 + h) : (iconY - 8);
+        if (top > logicH - 10) top = logicH - 10;
+        if (top - h < 10) top = h + 10;
+        return top;
+    }
+
+    /** 检测触摸是否在按键覆盖层的某个按钮上，返回按钮索引 0~6（= 键 1~7，也等于核心层槽位），否则返回 -1
+     * @param stickyKey 当前已按下的按钮索引（-1 表示无），用于"粘住"避免手指抖动时释放按键 */
     private int hitTest7KKey(float tx, float ty, int stickyKey) {
         if (ty < k7PanelY || ty > k7PanelY + k7BtnH) return -1;
 
-        // 先检查手指当前实际命中哪个键
+        // 先检查手指当前实际命中哪个按钮
         int actualHit = -1;
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < K7_BUTTON_COUNT; i++) {
             float bx = k7PanelX + i * (k7BtnW + K7_BTN_GAP);
             if (tx >= bx && tx <= bx + k7BtnW) {
                 actualHit = i;
@@ -839,16 +957,16 @@ public class FloatingMenu implements InputProcessor {
         return actualHit;
     }
 
-    /** 检测触摸是否在 7K 覆盖层的"关闭"按钮上 */
+    /** 检测触摸是否在按键覆盖层的"关闭"按钮上（矩形与绘制共用 k7CenterX/k7CloseY） */
     private boolean hitTest7KClose(float tx, float ty) {
         float closeW = 180;
-        float cx = (logicW - closeW) / 2f;
+        float cx = k7CenterX - closeW / 2f;
         return tx >= cx && tx <= cx + closeW && ty >= k7CloseY && ty <= k7CloseY + K7_CLOSE_H;
     }
 
     /**
      * 发送 7K 按键状态到核心层（绕过 setSimulatedKeyState 的 release bug）。
-     * 使用逻辑 key index（0~6 对应 7K 第 1~7 个 lane），由 LaneProperty 决定映射。
+     * keyIdx 是<b>槽位</b>索引（0~6 对应 7K 第 1~7 个 lane），由 LaneProperty 决定映射。
      */
     private void send7KKey(int keyIdx, boolean pressed) {
         if (kbInput == null) return;
@@ -882,8 +1000,9 @@ public class FloatingMenu implements InputProcessor {
     }
 
     /**
-     * 释放当前长按模拟的按键（NUM5 或 START）。同时关闭 7K 覆盖层。
-     * 用于关闭按钮、图标再次点击、按钮二次点击等所有收尾路径。
+     * 释放当前覆盖层模拟的按键（NUM5 / START / 结果界面直接模式），
+     * 同时关闭覆盖层并释放所有还按着的 7K 键。
+     * 用于关闭按钮、图标再次点击、按钮二次点击、切界面等所有收尾路径。
      */
     private void releaseHoldKey() {
         if (holdKeyType == HoldKeyType.NUM5 && kbInput != null) {
@@ -891,28 +1010,41 @@ public class FloatingMenu implements InputProcessor {
         } else if (holdKeyType == HoldKeyType.START) {
             sendStartKey(false);
         }
+        // 兜底：释放覆盖层里所有仍按下的键 —— 切界面/指针丢失时不会走 touchUp，
+        // 不释放会把核心层 keystate 留在 true 上（结果界面会当成一直按着）
+        for (int p = 0; p < pointer7KKey.length; p++) {
+            if (pointer7KKey[p] >= 0) {
+                send7KKey(pointer7KKey[p], false);
+                pointer7KKey[p] = -1;
+            }
+        }
         holdKeyType = HoldKeyType.NONE;
         holdKeyHeld = false;
     }
 
-    /** 绘制 7K 覆盖层：7 个键 + 标题 + 关闭按钮 */
+    /** 绘制按键覆盖层：7 个键 + 标题 + 关闭按钮 */
     private void draw7KOverlay(SpriteBatch sprite, BitmapFont font) {
         calculate7KOverlayLayout();
         GlyphLayout glyph = new GlyphLayout();
 
-        // 读取当前用户配置的 7 个 lane 键位（用户在 Key Config 中可改）
+        // 读取当前用户配置的键位（键 1~7，用户在 Key Config 中可改）
         int[] userKeys = (kbInput != null) ? kbInput.getKeys() : null;
         refresh7KKeyNamesCache(userKeys);
 
-        // 标题（上方居中）
+        // 标题（块上方居中）
         font.setColor(0.5f, 0.8f, 1f, 0.95f);
-        String heldName = (holdKeyType == HoldKeyType.START) ? "START" : "NUM5";
-        String title = heldName + " Long-Press: 7KEYS (tap again to release)";
+        String title;
+        if (holdKeyType == HoldKeyType.DIRECT) {
+            title = "Result Keys: 7KEYS (tap icon to close)";
+        } else {
+            String heldName = (holdKeyType == HoldKeyType.START) ? "START" : "NUM5";
+            title = heldName + " Long-Press: 7KEYS (tap again to release)";
+        }
         glyph.setText(font, title);
-        font.draw(sprite, title, (logicW - glyph.width) / 2f, k7TitleY + K7_TITLE_H * 0.7f);
+        font.draw(sprite, title, k7CenterX - glyph.width / 2f, k7TitleY + K7_TITLE_H * 0.7f);
 
-        // 7 个键
-        for (int i = 0; i < 7; i++) {
+        // 7 个键（按钮索引 i = 键 i+1 = 核心层槽位 i）
+        for (int i = 0; i < K7_BUTTON_COUNT; i++) {
             float bx = k7PanelX + i * (k7BtnW + K7_BTN_GAP);
 
             boolean pressed = false;
@@ -934,7 +1066,7 @@ public class FloatingMenu implements InputProcessor {
             sprite.draw(whitePixel, bx, k7PanelY, border, k7BtnH);
             sprite.draw(whitePixel, bx + k7BtnW - border, k7PanelY, border, k7BtnH);
 
-            // 键号（大字）
+            // 标签（大字）：1~7
             font.setColor(1, 1, 1, 0.95f);
             String num = String.valueOf(i + 1);
             glyph.setText(font, num);
@@ -947,9 +1079,9 @@ public class FloatingMenu implements InputProcessor {
             font.draw(sprite, keyName, bx + (k7BtnW - glyph.width) / 2f, k7PanelY + k7BtnH * 0.28f);
         }
 
-        // 关闭按钮（覆盖层下方居中）
+        // 关闭按钮（覆盖层下方，与块中心对齐）
         float closeW = 180;
-        float cx = (logicW - closeW) / 2f;
+        float cx = k7CenterX - closeW / 2f;
         sprite.setColor(0.6f, 0.2f, 0.2f, 0.85f);
         sprite.draw(whitePixel, cx, k7CloseY, closeW, K7_CLOSE_H);
         sprite.setColor(1, 1, 1, 0.9f);
@@ -959,17 +1091,24 @@ public class FloatingMenu implements InputProcessor {
         sprite.draw(whitePixel, cx + closeW - 2, k7CloseY, 2, K7_CLOSE_H);
 
         font.setColor(1, 1, 1, 0.95f);
-        String closeLabel = (holdKeyType == HoldKeyType.START) ? "Release START" : "Release NUM5";
+        String closeLabel;
+        if (holdKeyType == HoldKeyType.DIRECT) {
+            closeLabel = "Close";
+        } else {
+            closeLabel = (holdKeyType == HoldKeyType.START) ? "Release START" : "Release NUM5";
+        }
         glyph.setText(font, closeLabel);
         font.draw(sprite, closeLabel, cx + (closeW - glyph.width) / 2f, k7CloseY + (K7_CLOSE_H + glyph.height) / 2f);
     }
 
     /**
-     * 刷新 7K 覆盖层各键显示名称的缓存。仅在 keycode 实际变化时（如 Key Config 修改后）
-     * 重新调用 Keys.toString，避免每帧分配短 String 触发 GC 压力。
+     * 刷新覆盖层各按钮显示名称的缓存（[0..6] = 键 1..7）。
+     * 仅在 keycode 实际变化时（如 Key Config 修改后）重新调用 Keys.toString，
+     * 避免每帧分配短 String 触发 GC 压力。
      */
     private void refresh7KKeyNamesCache(int[] userKeys) {
-        for (int i = 0; i < 7; i++) {
+        for (int i = 0; i < K7_BUTTON_COUNT; i++) {
+            // 按钮 i 使用的键位槽：键 k → 槽位 k-1（与发送时的槽位索引一致）
             int keycode;
             if (userKeys != null && i < userKeys.length && userKeys[i] >= 0) {
                 keycode = userKeys[i];
@@ -1020,11 +1159,7 @@ public class FloatingMenu implements InputProcessor {
 
     /** 面板锚定：跟随浮动图标的位置，并做屏幕边界保护（通用列表页与频谱调整页共用） */
     private void anchorPanel(PanelLayout res) {
-        Config config = null;
-        if (kbInput != null && kbInput.getMainController() instanceof MainController) {
-            config = ((MainController) kbInput.getMainController()).getConfig();
-        }
-        int pos = (config != null) ? config.getFloatingMenuPosition() : 0;
+        int pos = floatingMenuPosition();
 
         // Y轴：底部图标向上弹出，顶部图标向下弹出
         if (pos >= 2) { // Bottom Center, Bottom Right
@@ -1104,7 +1239,7 @@ public class FloatingMenu implements InputProcessor {
                 Gdx.app.log("FloatingMenu", "7K overlay: closed via close button");
                 return true;
             }
-            // 7K 键 1~7
+            // 7K 键 1~7（按钮索引 i = 核心层槽位 i）
             int k7Idx = hitTest7KKey(tx, ty, pointer7KKey[pointer]);
             if (k7Idx >= 0) {
                 pointer7KKey[pointer] = k7Idx;
@@ -1113,11 +1248,14 @@ public class FloatingMenu implements InputProcessor {
                 send7KKey(k7Idx, true);
                 return true;
             }
-            // 点击浮动图标：关闭覆盖层并释放长按键（用户重开菜单后可再次点击释放）
+            // 点击浮动图标：关闭覆盖层并释放按住的键。
+            // 结果界面（DIRECT）不展开菜单面板，只关闭覆盖层。
             if (hitTestIcon(tx, ty)) {
                 releaseHoldKey();
-                expanded = true;
-                justExpandedByIcon = true;
+                if (!resultMode) {
+                    expanded = true;
+                    justExpandedByIcon = true;
+                }
                 pointerConsuming[pointer] = true;
                 pointerPressedIndex[pointer] = -1;
                 pointer7KKey[pointer] = -1;
@@ -1208,6 +1346,14 @@ public class FloatingMenu implements InputProcessor {
         } else {
             // 收起状态：检查是否点击了图标
             if (hitTestIcon(tx, ty)) {
+                // 结果界面：不做菜单面板，图标点击直接弹出 7K 键位覆盖层
+                // （覆盖层摆放跟随图标位置，见 calculate7KOverlayLayout 的 DIRECT 分支）
+                if (resultMode) {
+                    openDirectKeyOverlay();
+                    pointerConsuming[pointer] = true;
+                    pointerPressedIndex[pointer] = -1;
+                    return true;
+                }
                 if (isPlayMode) {
                     sinceLastInteraction = 0f;
                     playIconHidden = false;
@@ -1232,7 +1378,7 @@ public class FloatingMenu implements InputProcessor {
             if (isPlayMode) {
                 sinceLastInteraction = 0f;
             }
-            // 7K 覆盖层：释放对应的 7KEYS 键
+            // 覆盖层：释放对应的 7K 键
             int k7Idx = pointer7KKey[pointer];
             if (k7Idx >= 0) {
                 send7KKey(k7Idx, false);
@@ -1265,7 +1411,7 @@ public class FloatingMenu implements InputProcessor {
     public boolean touchDragged(int screenX, int screenY, int pointer) {
         if (!visible || pointer >= pointerConsuming.length) return false;
         if (pointerConsuming[pointer]) {
-            // 7K 覆盖层：始终跟随手指，按下当前命中键、释放之前的键
+            // 覆盖层：始终跟随手指，按下当前命中键、释放之前的键
             if (holdKeyHeld) {
                 float tx = screenToLogicX(screenX);
                 float ty = screenToLogicY(screenY);
@@ -1324,7 +1470,7 @@ public class FloatingMenu implements InputProcessor {
     @Override
     public boolean touchCancelled(int screenX, int screenY, int pointer, int button) {
         if (pointer < pointerConsuming.length) {
-            // 释放可能按住的 7K 键
+            // 释放可能按住的覆盖层按键
             int k7Idx = pointer7KKey[pointer];
             if (k7Idx >= 0) {
                 send7KKey(k7Idx, false);
