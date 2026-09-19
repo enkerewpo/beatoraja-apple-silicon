@@ -155,12 +155,14 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 		clearPendingPresses();
 		if (!textmode) {
 			// 强制状态心跳：确保模拟按键状态始终覆盖物理检测结果
+			// （只保持本地 keystate 即可 —— isControlKeyPressed 等消费方读的是本地状态；
+			//   这里 i 是 keycode，核心层是槽位索引空间，不能 setKeyState(i)，
+			//   lane 传播已由 setSimulatedKeyState 的 keyChanged 完成）
 			for (int i = 0; i < pendingPressDeadline.length; i++) {
 				if (pendingPressDeadline[i] == Long.MAX_VALUE) {
-					// 如果处于模拟长按锁定中，强制保持 keystate 和核心层状态为 true
+					// 如果处于模拟长按锁定中，强制保持 keystate 为 true
 					if (!keystate[i]) {
 						keystate[i] = true;
-						this.bmsPlayerInputProcessor.setKeyState(i, true, microtime);
 					}
 				}
 			}
@@ -236,8 +238,15 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 					Gdx.app.log("AndroidBack", "ESCAPE state changed to " + pressed + " with keytime=" + keytime[key.keycode]);
 				}
 
-				// 同步到核心层 (Fix: 使 NUM 和 符号区按键在 play 界面生效)
-				this.bmsPlayerInputProcessor.setKeyState(key.keycode, pressed, microtime);
+				// 注意：严禁在这里按 keycode 写核心层 keystate（历史代码曾写
+				// setKeyState(key.keycode, pressed)），核心层是"槽位"索引空间 ——
+				// 7K 模式槽位 7/8/9/10 = F-SCR/R-SCR/START/SELECT，而物理键值
+				// NUM_0=7、NUM_1=8、NUM_2=9、NUM_3=10 恰好与之重叠：按数字键会被
+				// 当成 scratch/START 长按，且释放转换与 kbinput.clear()（每首歌开始）
+				// 竞态时会卡死，只能靠重按 R-SCR 的绑定键发出 keyChanged 才能复位
+				// （F-SCR 是槽位 7，救不了卡死的槽位 8）。
+				// 绑定到轨道的按键由下方循环（无 duration 门限）和上方 lane 循环
+				// 通过 keyChanged 按槽位正确传播，无需此处同步。
 				// 如果该按键也被映射到了游戏轨道，触发 keyChanged
 				for (int i = 0; i < keys.length; i++) {
 					if (isKeyInPacked(keys[i], key.keycode)) {
@@ -509,8 +518,11 @@ public class KeyBoardInputProcesseor extends BMSPlayerInputDevice implements Inp
 			keystate[keycode] = pressed;
 			keytime[keycode] = pressed ? now : Long.MIN_VALUE;
 
-			// 同步到核心层
-			this.bmsPlayerInputProcessor.setKeyState(keycode, pressed, keytime[keycode]);
+			// 注意：严禁在这里按 keycode 写核心层（历史代码曾写
+			// setKeyState(keycode, pressed)）——核心层是"槽位"索引空间，keycode 是
+			// 物理键值空间，两者在数字键区域重叠（NUM_0=7 恰好是 7K 的 F-SCR 槽位），
+			// 模拟数字键会被当成 scratch 长按写入核心层。轨道传播只走下方
+			// keyChanged 循环（按槽位），与 poll() 的路径一致。
 
 			// 触发 keyChanged
 			for (int i = 0; i < keys.length; i++) {
