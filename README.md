@@ -2,11 +2,6 @@
   <img src="desktop/packaging/icon.png" width="112" alt="beatoraja Apple Silicon">
   <h1>beatoraja — Apple Silicon</h1>
   <p>A native LWJGL3 desktop backend for beatoraja. Runs on Apple Silicon without Rosetta.</p>
-  <br>
-  <img src="docs/screenshots/select.png" width="760" alt="Song select running natively on Apple Silicon">
-  <br><br>
-  <img src="docs/screenshots/launcher.png" width="340" alt="Launcher">
-  <p><sub>The launcher is a small native AppKit app, not the upstream JavaFX window.</sub></p>
 </div>
 
 ---
