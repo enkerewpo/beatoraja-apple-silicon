@@ -34,7 +34,7 @@ for candidate in \
         cd "$candidate" || exit 1
         exec "$JAVA" \
             -XstartOnFirstThread \
-            -Xms2g -Xmx4g -XX:+UseZGC \
+            -Xms512m -Xmx2g -XX:+UseZGC \
             -Dbeatoraja.root="$candidate" \
             -cp "$APP_ROOT/app/*" \
             com.starxh.beatoraja.desktop.DesktopLauncher "$@"

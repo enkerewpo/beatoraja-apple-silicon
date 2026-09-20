@@ -37,8 +37,12 @@ def macJvmArgs = org.gradle.internal.os.OperatingSystem.current().isMacOsX()
 
 // Rhythm games are very sensitive to GC pauses: a single G1 collection right after loading
 // a thousand keysounds drops frames. ZGC is a concurrent collector with sub-millisecond
-// pauses. Size the heap up front so it never has to grow mid-play.
-def gameJvmArgs = macJvmArgs + ['-Xms2g', '-Xmx4g', '-XX:+UseZGC']
+// pauses.
+//
+// Keep the heap modest. Measured usage is 150-500 MB, so -Xms2g -Xmx4g (an earlier setting)
+// reserved several times what the game needs; two instances were enough to push a 16 GB
+// machine into heavy swapping.
+def gameJvmArgs = macJvmArgs + ['-Xms512m', '-Xmx2g', '-XX:+UseZGC']
 
 def orajaHome = System.getProperty('user.home') + '/Games/beatoraja0.8.8-modernchic'
 
@@ -104,8 +108,8 @@ tasks.register('packageApp', Exec) {
             '--runtime-image', System.getProperty('java.home'),
             // Baked in because Finder starts the app without a shell to pass them
             '--java-options', '-XstartOnFirstThread',
-            '--java-options', '-Xms2g',
-            '--java-options', '-Xmx4g',
+            '--java-options', '-Xms512m',
+            '--java-options', '-Xmx2g',
             '--java-options', '-XX:+UseZGC',
             '--mac-package-identifier', 'dev.wheatfox.beatoraja'
 
