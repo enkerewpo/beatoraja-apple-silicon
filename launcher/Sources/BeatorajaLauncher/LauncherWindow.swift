@@ -1,59 +1,62 @@
 import AppKit
 
-/// The launcher window: tabs across the top, a form per tab, and a Play button in the footer.
+/// The launcher window.
 ///
-/// The shape follows upstream beatoraja's configuration window, which is what anyone coming
-/// from the Windows build expects. Layout uses NSGridView so labels and controls line up on
-/// a real baseline grid rather than being stacked by hand.
+/// Laid out to mirror upstream beatoraja's JavaFX configuration window - the player row on
+/// top, the same tabs and field groups, the same action buttons along the bottom - so anyone
+/// coming from the Windows build finds what they expect, but built from native macOS
+/// controls: NSTabView, NSGridView for baseline-aligned forms, NSBox for the group headers,
+/// NSSwitch, NSSlider and NSTableView.
 ///
-/// AppKit rather than SwiftUI: SwiftUI's property wrappers are macros in current SDKs, and
+/// Only the tabs this port can actually back with settings are present. Upstream also has
+/// Input, Music Select, Play Option, Skin, IR, Table and Stream; showing empty shells of
+/// those would be worse than leaving them out.
+///
+/// AppKit rather than SwiftUI: SwiftUI's property wrappers are macros in current SDKs and
 /// the macro plugins ship only with Xcode, not with the Command Line Tools.
 final class LauncherWindow: NSWindowController {
 
     private var config: BeatorajaConfig?
     private let runner = GameRunner()
 
-    // Header
-    private let iconView = NSImageView()
-    private let rootLabel = NSTextField(labelWithString: "")
+    // Player row
+    private let playerPopup = NSPopUpButton()
+    private let playerField = NSTextField()
 
-    // Library tab
-    private let folderTable = NSTableView()
-    private var folders: [String] = []
-    private let removeButton = NSButton()
-
-    // Display tab
+    // Video
+    private let displayModePopup = NSPopUpButton()
     private let resolutionPopup = NSPopUpButton()
-    private let fullscreenSwitch = NSSwitch()
-    private let bgaSwitch = NSSwitch()
     private let vsyncSwitch = NSSwitch()
-    private let fpsSlider = NSSlider()
-    private let fpsValue = NSTextField(labelWithString: "60")
+    private let maxFpsField = NSTextField()
+    private let bgaPopup = NSPopUpButton()
 
-    // Audio tab
+    // Audio
+    private let driverPopup = NSPopUpButton()
+    private let bufferPopup = NSPopUpButton()
     private let sourcesSlider = NSSlider()
     private let sourcesValue = NSTextField(labelWithString: "256")
-    private let bufferPopup = NSPopUpButton()
 
-    // Player tab
-    private let nameField = NSTextField()
+    // Resource
+    private let pathTable = NSTableView()
+    private var songPaths: [String] = []
+    private let removePathButton = NSButton()
 
     // Footer
     private let statusLabel = NSTextField(labelWithString: "")
     private let spinner = NSProgressIndicator()
-    private let playButton = NSButton()
 
-    private static let bufferSizes = [256, 512, 1024, 2048, 4096, 8192]
+    private static let bufferSizes = [256, 384, 512, 1024, 2048, 4096, 8192]
+    private static let bgaModes = ["On", "Auto", "Off"]
+    private static let displayModes = ["Window", "Borderless", "Fullscreen"]
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 430),
+            contentRect: NSRect(x: 0, y: 0, width: 700, height: 470),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        window.title = "beatoraja"
-        window.titlebarAppearsTransparent = true
+        window.title = "beatoraja configuration"
         window.center()
         self.init(window: window)
         buildUI()
@@ -65,227 +68,205 @@ final class LauncherWindow: NSWindowController {
     private func buildUI() {
         guard let content = window?.contentView else { return }
 
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 0
-        root.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(root)
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            root.topAnchor.constraint(equalTo: content.topAnchor),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-        ])
+        // Explicit constraints rather than one top-to-bottom stack: with fixed-height
+        // children a stack pinned at both ends leaves its slack below the last view, which
+        // stranded the buttons well above the window edge. Pin the ends, let the tabs take
+        // whatever is left.
+        let player = playerRow()
+        let tabView = tabs()
+        let actions = footer()
 
-        root.addArrangedSubview(makeHeader())
-        root.addArrangedSubview(makeTabs())
-        root.addArrangedSubview(makeFooter())
+        for view in [player, tabView, actions] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(view)
+        }
+
+        NSLayoutConstraint.activate([
+            player.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            player.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            player.topAnchor.constraint(equalTo: content.topAnchor),
+
+            tabView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            tabView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            tabView.topAnchor.constraint(equalTo: player.bottomAnchor),
+
+            actions.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            actions.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            actions.topAnchor.constraint(equalTo: tabView.bottomAnchor),
+            actions.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+        ])
     }
 
-    private func makeHeader() -> NSView {
-        iconView.image = NSImage(named: NSImage.applicationIconName)
-        iconView.imageScaling = .scaleProportionallyUpOrDown
-        iconView.translatesAutoresizingMaskIntoConstraints = false
-        iconView.widthAnchor.constraint(equalToConstant: 42).isActive = true
-        iconView.heightAnchor.constraint(equalToConstant: 42).isActive = true
+    /// Mirrors upstream's "Player ID  [combo] [name] [+]" row above the tabs.
+    private func playerRow() -> NSView {
+        let label = NSTextField(labelWithString: "Player ID")
+        label.font = .systemFont(ofSize: 12)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.widthAnchor.constraint(equalToConstant: 70).isActive = true
 
-        let title = NSTextField(labelWithString: "beatoraja")
-        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        playerPopup.translatesAutoresizingMaskIntoConstraints = false
+        playerPopup.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        playerPopup.target = self
+        playerPopup.action = #selector(playerChanged)
 
-        let subtitle = NSTextField(labelWithString: "Apple Silicon")
-        subtitle.font = .systemFont(ofSize: 11)
-        subtitle.textColor = .secondaryLabelColor
+        playerField.target = self
+        playerField.action = #selector(playerChanged)
 
-        let titles = NSStackView(views: [title, subtitle])
-        titles.orientation = .vertical
-        titles.alignment = .leading
-        titles.spacing = 1
+        let add = NSButton(title: "+", target: self, action: #selector(addPlayer))
+        add.bezelStyle = .rounded
+        add.translatesAutoresizingMaskIntoConstraints = false
+        add.widthAnchor.constraint(equalToConstant: 32).isActive = true
 
-        rootLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
-        rootLabel.textColor = .tertiaryLabelColor
-        rootLabel.lineBreakMode = .byTruncatingHead
-        rootLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        let changeButton = NSButton(title: "Change…", target: self, action: #selector(chooseRoot))
-        changeButton.bezelStyle = .rounded
-        changeButton.controlSize = .small
-
-        let row = NSStackView(views: [iconView, titles, NSView(), rootLabel, changeButton])
-        row.spacing = 10
+        let row = NSStackView(views: [label, playerPopup, playerField, add])
+        row.spacing = 8
         row.alignment = .centerY
-        row.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
+        row.edgeInsets = NSEdgeInsets(top: 14, left: 20, bottom: 10, right: 20)
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: 660).isActive = true
         return row
     }
 
-    private func makeTabs() -> NSTabView {
-        let tabs = NSTabView()
-        tabs.translatesAutoresizingMaskIntoConstraints = false
-        tabs.widthAnchor.constraint(equalToConstant: 660).isActive = true
-        tabs.heightAnchor.constraint(equalToConstant: 300).isActive = true
-
-        tabs.addTabViewItem(tab("Library", libraryTab()))
-        tabs.addTabViewItem(tab("Display", displayTab()))
-        tabs.addTabViewItem(tab("Audio", audioTab()))
-        tabs.addTabViewItem(tab("Player", playerTab()))
-        return tabs
+    private func tabs() -> NSTabView {
+        let view = NSTabView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        view.heightAnchor.constraint(equalToConstant: 340).isActive = true
+        view.addTabViewItem(tab("Video", videoTab()))
+        view.addTabViewItem(tab("Audio", audioTab()))
+        view.addTabViewItem(tab("Resource", resourceTab()))
+        // Upstream opens on Video; match that rather than whatever AppKit picks last
+        view.selectTabViewItem(at: 0)
+        return view
     }
 
-    private func tab(_ label: String, _ view: NSView) -> NSTabViewItem {
+    private func tab(_ label: String, _ body: NSView) -> NSTabViewItem {
         let item = NSTabViewItem(identifier: label)
         item.label = label
         let host = NSView()
-        view.translatesAutoresizingMaskIntoConstraints = false
-        host.addSubview(view)
+        body.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(body)
         NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 18),
-            view.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -18),
-            view.topAnchor.constraint(equalTo: host.topAnchor, constant: 16),
+            body.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 20),
+            body.trailingAnchor.constraint(lessThanOrEqualTo: host.trailingAnchor, constant: -20),
+            body.topAnchor.constraint(equalTo: host.topAnchor, constant: 18),
         ])
         item.view = host
         return item
     }
 
-    // MARK: - Tabs
+    // MARK: - Video tab, mirroring DISPLAY and BGA groups
 
-    private func libraryTab() -> NSView {
-        folderTable.headerView = nil
-        folderTable.rowHeight = 20
-        folderTable.style = .inset
-        folderTable.dataSource = self
-        folderTable.delegate = self
-        folderTable.target = self
-        folderTable.action = #selector(folderSelectionChanged)
-        let column = NSTableColumn(identifier: .init("path"))
-        column.width = 560
-        folderTable.addTableColumn(column)
+    private func videoTab() -> NSView {
+        displayModePopup.addItems(withTitles: Self.displayModes)
+        displayModePopup.target = self
+        displayModePopup.action = #selector(videoChanged)
 
-        let scroll = NSScrollView()
-        scroll.documentView = folderTable
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 150).isActive = true
-
-        let add = toolButton("plus", #selector(addFolder), "Add a song folder")
-        removeButton.image = NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove")
-        removeButton.bezelStyle = .smallSquare
-        removeButton.target = self
-        removeButton.action = #selector(removeFolder)
-        removeButton.isEnabled = false
-        removeButton.translatesAutoresizingMaskIntoConstraints = false
-        removeButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
-
-        let rescan = NSButton(title: "Rescan library", target: self, action: #selector(rescan))
-        rescan.bezelStyle = .rounded
-
-        let buttons = NSStackView(views: [add, removeButton, NSView(), rescan])
-        buttons.spacing = 6
-        buttons.alignment = .centerY
-
-        let note = hint("Charts are found by walking these folders. Rescan after adding or removing any.")
-
-        let stack = NSStackView(views: [scroll, buttons, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        scroll.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        buttons.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        return stack
-    }
-
-    private func displayTab() -> NSView {
         resolutionPopup.addItems(withTitles: BeatorajaConfig.resolutions)
         resolutionPopup.target = self
-        resolutionPopup.action = #selector(displayChanged)
+        resolutionPopup.action = #selector(videoChanged)
 
-        for sw in [fullscreenSwitch, bgaSwitch, vsyncSwitch] {
-            sw.target = self
-            sw.action = #selector(displayChanged)
-        }
+        vsyncSwitch.target = self
+        vsyncSwitch.action = #selector(videoChanged)
 
-        fpsSlider.minValue = 30
-        fpsSlider.maxValue = 240
-        fpsSlider.numberOfTickMarks = 8
-        fpsSlider.allowsTickMarkValuesOnly = true
-        fpsSlider.target = self
-        fpsSlider.action = #selector(fpsChanged)
-        fpsSlider.translatesAutoresizingMaskIntoConstraints = false
-        fpsSlider.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        fpsValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        fpsValue.textColor = .secondaryLabelColor
+        maxFpsField.translatesAutoresizingMaskIntoConstraints = false
+        maxFpsField.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        maxFpsField.target = self
+        maxFpsField.action = #selector(videoChanged)
 
-        let grid = NSGridView(views: [
-            [label("Resolution"), resolutionPopup],
-            [label("Fullscreen"), fullscreenSwitch],
-            [label("Background animation"), bgaSwitch],
-            [label("Vertical sync"), vsyncSwitch],
-            [label("Frame cap"), pair(fpsSlider, fpsValue)],
+        bgaPopup.addItems(withTitles: Self.bgaModes)
+        bgaPopup.target = self
+        bgaPopup.action = #selector(videoChanged)
+
+        let grid = form([
+            .header("Display"),
+            .field("Display mode", displayModePopup),
+            .field("Resolution", resolutionPopup),
+            .field("Vertical sync", vsyncSwitch),
+            .field("Max FPS", maxFpsField),
+            .header("BGA"),
+            .field("Background animation", bgaPopup),
         ])
-        grid.rowSpacing = 12
-        grid.columnSpacing = 14
-        grid.column(at: 0).xPlacement = .trailing
 
-        let note = hint("GLFW does not reliably honour vsync in windowed mode on macOS, so the rate is capped explicitly as well.")
-        let stack = NSStackView(views: [grid, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 14
-        return stack
+        let note = hint("GLFW does not reliably honour vsync in windowed mode on macOS, so Max FPS is enforced on top of it.")
+        return column([grid, note])
     }
 
+    // MARK: - Audio tab
+
     private func audioTab() -> NSView {
-        sourcesSlider.minValue = 16
-        sourcesSlider.maxValue = 1024
-        sourcesSlider.target = self
-        sourcesSlider.action = #selector(audioChanged)
-        sourcesSlider.translatesAutoresizingMaskIntoConstraints = false
-        sourcesSlider.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        sourcesValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        sourcesValue.textColor = .secondaryLabelColor
+        driverPopup.addItems(withTitles: ["OpenAL"])
+        driverPopup.isEnabled = false
+        driverPopup.toolTip = "PortAudio ships Windows binaries only, so OpenAL is the sole option here."
 
         bufferPopup.addItems(withTitles: Self.bufferSizes.map(String.init))
         bufferPopup.target = self
         bufferPopup.action = #selector(audioChanged)
 
-        let grid = NSGridView(views: [
-            [label("Simultaneous keysounds"), pair(sourcesSlider, sourcesValue)],
-            [label("Buffer size"), bufferPopup],
+        sourcesSlider.minValue = 16
+        sourcesSlider.maxValue = 1024
+        sourcesSlider.target = self
+        sourcesSlider.action = #selector(audioChanged)
+        sourcesSlider.translatesAutoresizingMaskIntoConstraints = false
+        sourcesSlider.widthAnchor.constraint(equalToConstant: 190).isActive = true
+        sourcesValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        sourcesValue.textColor = .secondaryLabelColor
+
+        let grid = form([
+            .header("Audio output"),
+            .field("Driver", driverPopup),
+            .field("Buffer size", bufferPopup),
+            .field("Simultaneous sources", pair(sourcesSlider, sourcesValue)),
         ])
-        grid.rowSpacing = 12
-        grid.columnSpacing = 14
-        grid.column(at: 0).xPlacement = .trailing
 
         let note = hint("Notes fall silent once the voices run out — 16 is the libGDX default and far too low for dense charts. Larger buffers trade latency for fewer dropouts.")
-        let stack = NSStackView(views: [grid, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 14
-        return stack
+        return column([grid, note])
     }
 
-    private func playerTab() -> NSView {
-        nameField.translatesAutoresizingMaskIntoConstraints = false
-        nameField.widthAnchor.constraint(equalToConstant: 220).isActive = true
-        nameField.target = self
-        nameField.action = #selector(playerChanged)
+    // MARK: - Resource tab
 
-        let grid = NSGridView(views: [[label("Name"), nameField]])
-        grid.rowSpacing = 12
-        grid.columnSpacing = 14
-        grid.column(at: 0).xPlacement = .trailing
+    private func resourceTab() -> NSView {
+        pathTable.headerView = nil
+        pathTable.rowHeight = 20
+        pathTable.style = .inset
+        pathTable.dataSource = self
+        pathTable.delegate = self
+        pathTable.target = self
+        pathTable.action = #selector(pathSelectionChanged)
+        let pathColumn = NSTableColumn(identifier: .init("path"))
+        pathColumn.width = 580
+        pathTable.addTableColumn(pathColumn)
 
-        let note = hint("Scores and settings are stored per player under player/ in the installation folder.")
-        let stack = NSStackView(views: [grid, note])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 14
-        return stack
+        let scroll = NSScrollView()
+        scroll.documentView = pathTable
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 140).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: 620).isActive = true
+
+        let add = squareButton("plus", #selector(addPath), "Add a BMS folder")
+        removePathButton.image = NSImage(systemSymbolName: "minus", accessibilityDescription: "Remove")
+        removePathButton.bezelStyle = .smallSquare
+        removePathButton.target = self
+        removePathButton.action = #selector(removePath)
+        removePathButton.isEnabled = false
+        removePathButton.translatesAutoresizingMaskIntoConstraints = false
+        removePathButton.widthAnchor.constraint(equalToConstant: 28).isActive = true
+
+        let update = NSButton(title: "Update song database", target: self, action: #selector(rescan))
+        update.bezelStyle = .rounded
+
+        let buttons = NSStackView(views: [add, removePathButton, NSView(), update])
+        buttons.spacing = 6
+        buttons.alignment = .centerY
+        buttons.translatesAutoresizingMaskIntoConstraints = false
+        buttons.widthAnchor.constraint(equalToConstant: 620).isActive = true
+
+        let header = groupLabel("BMS path")
+        return column([header, scroll, buttons])
     }
 
-    private func makeFooter() -> NSView {
+    // MARK: - Footer, mirroring upstream's action row
+
+    private func footer() -> NSView {
         statusLabel.font = .systemFont(ofSize: 11)
         statusLabel.textColor = .secondaryLabelColor
 
@@ -295,27 +276,69 @@ final class LauncherWindow: NSWindowController {
         spinner.translatesAutoresizingMaskIntoConstraints = false
         spinner.widthAnchor.constraint(equalToConstant: 16).isActive = true
 
-        playButton.title = "Play"
-        playButton.bezelStyle = .rounded
-        playButton.controlSize = .large
-        playButton.keyEquivalent = "\r"
-        playButton.target = self
-        playButton.action = #selector(play)
+        let play = NSButton(title: "Play", target: self, action: #selector(play))
+        play.bezelStyle = .rounded
+        play.controlSize = .large
+        play.keyEquivalent = "\r"
 
-        let row = NSStackView(views: [spinner, statusLabel, NSView(), playButton])
+        let exit = NSButton(title: "Exit", target: self, action: #selector(quit))
+        exit.bezelStyle = .rounded
+
+        let row = NSStackView(views: [spinner, statusLabel, NSView(), exit, play])
         row.spacing = 8
         row.alignment = .centerY
-        row.edgeInsets = NSEdgeInsets(top: 10, left: 20, bottom: 14, right: 20)
+        row.edgeInsets = NSEdgeInsets(top: 12, left: 20, bottom: 12, right: 20)
         row.translatesAutoresizingMaskIntoConstraints = false
-        row.widthAnchor.constraint(equalToConstant: 660).isActive = true
         return row
     }
 
-    // MARK: - Small builders
+    // MARK: - Builders
 
-    private func label(_ text: String) -> NSTextField {
-        let l = NSTextField(labelWithString: text)
-        l.font = .systemFont(ofSize: 12)
+    /// One row of a form: either a group caption spanning both columns, or a label/control pair.
+    enum FormRow {
+        case header(String)
+        case field(String, NSView)
+    }
+
+    /// Builds the whole tab as a single NSGridView.
+    ///
+    /// One grid per tab rather than one per group: separate grids size their columns
+    /// independently, so controls in different groups end up a few points apart and the form
+    /// visibly fails to line up. Group captions are merged across both columns so they sit at
+    /// the left edge of the label column instead of floating far from it.
+    private func form(_ rows: [FormRow]) -> NSGridView {
+        let grid = NSGridView(numberOfColumns: 2, rows: 0)
+        grid.rowSpacing = 10
+        grid.columnSpacing = 12
+        // Left-aligned labels, as upstream's window has them. With right alignment the
+        // section captions sit at the column's left edge while the labels end at its right,
+        // leaving a wide gap between the two; sharing one left edge reads as a single form.
+        grid.column(at: 0).xPlacement = .leading
+        grid.column(at: 0).width = 150
+
+        for (index, row) in rows.enumerated() {
+            switch row {
+            case .header(let title):
+                let caption = groupLabel(title)
+                let gridRow = grid.addRow(with: [caption, NSGridCell.emptyContentView])
+                grid.mergeCells(inHorizontalRange: NSRange(location: 0, length: 2),
+                                verticalRange: NSRange(location: index, length: 1))
+                // Breathing room above a caption, except the first one
+                gridRow.topPadding = index == 0 ? 0 : 10
+
+            case .field(let title, let control):
+                let caption = NSTextField(labelWithString: title)
+                caption.font = .systemFont(ofSize: 12)
+                grid.addRow(with: [caption, control])
+            }
+        }
+        return grid
+    }
+
+    private func groupLabel(_ text: String) -> NSTextField {
+        let l = NSTextField(labelWithString: text.uppercased())
+        l.font = .systemFont(ofSize: 10, weight: .semibold)
+        l.textColor = .secondaryLabelColor
         return l
     }
 
@@ -324,8 +347,16 @@ final class LauncherWindow: NSWindowController {
         l.font = .systemFont(ofSize: 10)
         l.textColor = .tertiaryLabelColor
         l.translatesAutoresizingMaskIntoConstraints = false
-        l.widthAnchor.constraint(equalToConstant: 600).isActive = true
+        l.widthAnchor.constraint(equalToConstant: 620).isActive = true
         return l
+    }
+
+    private func column(_ views: [NSView]) -> NSStackView {
+        let s = NSStackView(views: views)
+        s.orientation = .vertical
+        s.alignment = .leading
+        s.spacing = 18
+        return s
     }
 
     private func pair(_ a: NSView, _ b: NSView) -> NSStackView {
@@ -335,7 +366,7 @@ final class LauncherWindow: NSWindowController {
         return s
     }
 
-    private func toolButton(_ symbol: String, _ action: Selector, _ tip: String) -> NSButton {
+    private func squareButton(_ symbol: String, _ action: Selector, _ tip: String) -> NSButton {
         let b = NSButton()
         b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
         b.bezelStyle = .smallSquare
@@ -361,19 +392,25 @@ final class LauncherWindow: NSWindowController {
     private func adopt(_ root: URL) {
         let cfg = BeatorajaConfig(root: root)
         config = cfg
-        folders = cfg.songFolders
-        rootLabel.stringValue = root.path
-        folderTable.reloadData()
+        songPaths = cfg.songFolders
+        pathTable.reloadData()
+
+        playerPopup.removeAllItems()
+        playerPopup.addItems(withTitles: cfg.knownPlayers)
+        playerPopup.selectItem(withTitle: cfg.playerName)
+        playerField.stringValue = cfg.playerName
+
+        displayModePopup.selectItem(withTitle: cfg.fullscreen ? "Fullscreen" : "Window")
         resolutionPopup.selectItem(withTitle: cfg.resolution)
-        fullscreenSwitch.state = cfg.fullscreen ? .on : .off
-        bgaSwitch.state = cfg.bgaEnabled ? .on : .off
         vsyncSwitch.state = cfg.vsync ? .on : .off
-        fpsSlider.doubleValue = 60
-        fpsValue.stringValue = "60"
+        maxFpsField.stringValue = String(cfg.maxFps)
+        bgaPopup.selectItem(at: cfg.bgaMode)
+
+        bufferPopup.selectItem(withTitle: String(cfg.bufferSize))
         sourcesSlider.doubleValue = Double(cfg.simultaneousSources)
         sourcesValue.stringValue = String(cfg.simultaneousSources)
-        bufferPopup.selectItem(withTitle: String(cfg.bufferSize))
-        nameField.stringValue = cfg.playerName
+
+        window?.title = "beatoraja configuration — \(root.lastPathComponent)"
         statusLabel.stringValue = "Ready"
     }
 
@@ -405,18 +442,15 @@ final class LauncherWindow: NSWindowController {
         adopt(url)
     }
 
-    @objc private func displayChanged() {
+    @objc private func videoChanged() {
         guard var cfg = config else { return }
+        cfg.fullscreen = displayModePopup.titleOfSelectedItem != "Window"
         cfg.resolution = resolutionPopup.titleOfSelectedItem ?? "HD"
-        cfg.fullscreen = fullscreenSwitch.state == .on
-        cfg.bgaEnabled = bgaSwitch.state == .on
         cfg.vsync = vsyncSwitch.state == .on
+        if let fps = Int(maxFpsField.stringValue), fps > 0 { cfg.maxFps = fps }
+        cfg.bgaMode = bgaPopup.indexOfSelectedItem
         config = cfg
         persist()
-    }
-
-    @objc private func fpsChanged() {
-        fpsValue.stringValue = String(Int(fpsSlider.doubleValue))
     }
 
     @objc private func audioChanged() {
@@ -430,38 +464,50 @@ final class LauncherWindow: NSWindowController {
     }
 
     @objc private func playerChanged() {
-        guard var cfg = config, !nameField.stringValue.isEmpty else { return }
-        cfg.playerName = nameField.stringValue
+        guard var cfg = config else { return }
+        let name = playerField.stringValue.isEmpty
+            ? (playerPopup.titleOfSelectedItem ?? "player1")
+            : playerField.stringValue
+        cfg.playerName = name
+        playerField.stringValue = name
         config = cfg
         persist()
     }
 
-    @objc private func folderSelectionChanged() {
-        removeButton.isEnabled = folderTable.selectedRow >= 0
+    @objc private func addPlayer() {
+        let name = playerField.stringValue
+        guard !name.isEmpty, playerPopup.itemTitles.contains(name) == false else { return }
+        playerPopup.addItem(withTitle: name)
+        playerPopup.selectItem(withTitle: name)
+        playerChanged()
     }
 
-    @objc private func addFolder() {
+    @objc private func pathSelectionChanged() {
+        removePathButton.isEnabled = pathTable.selectedRow >= 0
+    }
+
+    @objc private func addPath() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.prompt = "Add"
         guard panel.runModal() == .OK, let url = panel.url, var cfg = config else { return }
-        guard !folders.contains(url.path) else { return }
-        folders.append(url.path)
-        cfg.songFolders = folders
+        guard !songPaths.contains(url.path) else { return }
+        songPaths.append(url.path)
+        cfg.songFolders = songPaths
         config = cfg
-        folderTable.reloadData()
+        pathTable.reloadData()
         persist()
     }
 
-    @objc private func removeFolder() {
-        let row = folderTable.selectedRow
-        guard row >= 0, row < folders.count, var cfg = config else { return }
-        folders.remove(at: row)
-        cfg.songFolders = folders
+    @objc private func removePath() {
+        let row = pathTable.selectedRow
+        guard row >= 0, row < songPaths.count, var cfg = config else { return }
+        songPaths.remove(at: row)
+        cfg.songFolders = songPaths
         config = cfg
-        folderTable.reloadData()
-        folderSelectionChanged()
+        pathTable.reloadData()
+        pathSelectionChanged()
         persist()
     }
 
@@ -482,22 +528,26 @@ final class LauncherWindow: NSWindowController {
             statusLabel.stringValue = "beatoraja.app not found next to this launcher"
             return
         }
-        runner.launch(app: app, root: cfg.root, fpsCap: Int(fpsSlider.doubleValue))
+        runner.launch(app: app, root: cfg.root, fpsCap: cfg.maxFps)
         statusLabel.stringValue = runner.lastError ?? "Launched"
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
     }
 }
 
-// MARK: - Folder table
+// MARK: - BMS path table
 
 extension LauncherWindow: NSTableViewDataSource, NSTableViewDelegate {
 
     func numberOfRows(in tableView: NSTableView) -> Int {
-        folders.count
+        songPaths.count
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let cell = NSTableCellView()
-        let text = NSTextField(labelWithString: folders[row])
+        let text = NSTextField(labelWithString: songPaths[row])
         text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         text.lineBreakMode = .byTruncatingHead
         text.translatesAutoresizingMaskIntoConstraints = false

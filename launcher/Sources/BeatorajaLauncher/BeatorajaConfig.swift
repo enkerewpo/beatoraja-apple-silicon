@@ -48,9 +48,14 @@ struct BeatorajaConfig {
     }
 
     /// 0 = on, 1 = auto, 2 = off, matching Config.BGA_* in core.
-    var bgaEnabled: Bool {
-        get { (json["bga"] as? Int ?? 0) != 2 }
-        set { json["bga"] = newValue ? 0 : 2 }
+    var bgaMode: Int {
+        get { json["bga"] as? Int ?? 0 }
+        set { json["bga"] = max(0, min(2, newValue)) }
+    }
+
+    var maxFps: Int {
+        get { json["maxFramePerSecond"] as? Int ?? 60 }
+        set { json["maxFramePerSecond"] = newValue }
     }
 
     var vsync: Bool {
@@ -93,6 +98,14 @@ struct BeatorajaConfig {
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
         try data.write(to: configURL, options: .atomic)
+    }
+
+    /// Player profiles live one directory each under player/.
+    var knownPlayers: [String] {
+        let dir = root.appendingPathComponent("player")
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        let profiles = names.filter { !$0.hasPrefix(".") }.sorted()
+        return profiles.isEmpty ? [playerName] : profiles
     }
 
     // MARK: - Installation discovery
