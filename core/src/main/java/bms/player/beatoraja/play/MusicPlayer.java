@@ -926,12 +926,27 @@ public class MusicPlayer extends MainState {
 	}
 
 	private void drawStagefile(SpriteBatch batch) {
-		if (stagefile == null) return;
+		// 一次快照,后面只用这个局部引用 —— 判空之后再读一次字段是崩溃源。
+		//
+		// stagefile 会被 loader 线程(loadSingle)和 worker 线程(自动切歌)通过
+		// retireStagefile() 置空,与本方法并发。而 batch.begin() 恰好夹在"判空"和
+		// "传给 draw"这两次字段读之间(几十微秒的 JNI/GL 调用),那个 null 完全可能
+		// 落进 batch.draw() —— 而 SpriteBatch.draw(null, ...) 不会当场抛异常:
+		// 5 参数重载只做 "if (texture != lastTexture) switchTexture(texture)",
+		// 而 end() 会把 lastTexture 置成 null,于是 null != null 为假,连 switchTexture
+		// 都不走,顶点照样写进缓冲(UV 是写死的 0/1)。要到 batch.end() → flush() →
+		// lastTexture.bind() 才 NPE。这就是崩溃栈指向 end()、看起来和封面毫无关系的原因
+		// (libGDX 1.14 SpriteBatch.java:206 置 null / :531 判等 / :975 bind)。
+		//
+		// 被 retire 掉的那张图不会在本帧被释放:drainRetiredTextures() 在 render() 开头跑,
+		// 本帧 drain 之后才 retire 的,要到下一帧才 dispose。所以拿本地引用画一帧是安全的。
+		Texture tex = stagefile;
+		if (tex == null) return;
 		float x = (skinW - STAGEFILE_W) / 2f;
 		float y = (skinH - STAGEFILE_H) / 2f;
 		batch.begin();
 		batch.setColor(1, 1, 1, 1);
-		batch.draw(stagefile, x, y, STAGEFILE_W, STAGEFILE_H);
+		batch.draw(tex, x, y, STAGEFILE_W, STAGEFILE_H);
 		batch.end();
 	}
 
