@@ -3,9 +3,9 @@
   <h1>beatoraja — Apple Silicon</h1>
   <p>A native LWJGL3 desktop backend for beatoraja. Runs on Apple Silicon without Rosetta.</p>
   <br>
-  <img src="docs/select.png" width="720" alt="Song select running natively on Apple Silicon">
+  <img src="docs/select.png" width="900" alt="Song select running natively on Apple Silicon">
   <br><br>
-  <img src="docs/launcher.png" width="470" alt="Configuration window">
+  <img src="docs/launcher.png" width="620" alt="Configuration window">
   <p><sub>The configuration window follows upstream's layout, built from native macOS controls.</sub></p>
 </div>
 
