@@ -53,8 +53,14 @@ struct BeatorajaConfig {
         set { json["bga"] = max(0, min(2, newValue)) }
     }
 
+    /// 0 = full, 1 = keep aspect ratio, 2 = off, matching Config.BGAEXPAND_* in core.
+    var bgaExpand: Int {
+        get { json["bgaExpand"] as? Int ?? 1 }
+        set { json["bgaExpand"] = max(0, min(2, newValue)) }
+    }
+
     var maxFps: Int {
-        get { json["maxFramePerSecond"] as? Int ?? 60 }
+        get { json["maxFramePerSecond"] as? Int ?? 300 }
         set { json["maxFramePerSecond"] = newValue }
     }
 
@@ -83,6 +89,27 @@ struct BeatorajaConfig {
         set { audio["deviceBufferSize"] = newValue }
     }
 
+    /// 0 lets the device pick. Upstream exposes the same list of explicit rates.
+    var sampleRate: Int {
+        get { audio["sampleRate"] as? Int ?? 0 }
+        set { audio["sampleRate"] = newValue }
+    }
+
+    var systemVolume: Double {
+        get { audio["systemvolume"] as? Double ?? 1.0 }
+        set { audio["systemvolume"] = newValue }
+    }
+
+    var keyVolume: Double {
+        get { audio["keyvolume"] as? Double ?? 0.5 }
+        set { audio["keyvolume"] = newValue }
+    }
+
+    var bgVolume: Double {
+        get { audio["bgvolume"] as? Double ?? 0.5 }
+        set { audio["bgvolume"] = newValue }
+    }
+
     // MARK: - Player
 
     var playerName: String {
@@ -92,12 +119,15 @@ struct BeatorajaConfig {
 
     // MARK: - Persistence
 
-    func save() throws {
-        let data = try JSONSerialization.data(
+    func encoded() throws -> Data {
+        try JSONSerialization.data(
             withJSONObject: json,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         )
-        try data.write(to: configURL, options: .atomic)
+    }
+
+    func save() throws {
+        try encoded().write(to: configURL, options: .atomic)
     }
 
     /// Player profiles live one directory each under player/.

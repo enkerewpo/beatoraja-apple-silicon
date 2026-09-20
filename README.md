@@ -100,10 +100,12 @@ This was not always true. `SongUtils.crc32` in this fork had picked up two steps
 - `DesktopLauncher` — LWJGL3 entry point
 - `JdbcSongDatabaseAccessor` — JDBC song database reader and writer
 - `SongScanner` / `ScanTool` — song library scanning, also runnable headless
+- `StubScoreDatabaseAccessor` — score database stub, not implemented
+- `AudioBenchmark` — the audio verification above
 
 ### New `launcher/` module
 
-A small native AppKit app that edits `config.json` and starts the game.
+A small native SwiftUI app that edits `config.json` and starts the game.
 
 Upstream shows a JavaFX configuration window before the game; the Android fork this is built
 on stripped that out entirely, so it had to be rebuilt. It could not simply be ported back:
@@ -112,17 +114,21 @@ any AppKit or JavaFX event loop, so the two cannot share a process — which is 
 the upstream window deadlocks the LWJGL3 backend. A separate process was mandatory either
 way, so a native one is both smaller and better behaved than bundling JavaFX.
 
-AppKit rather than SwiftUI because SwiftUI's property wrappers are macros in current SDKs
-and the macro plugins ship only with Xcode, not the Command Line Tools.
+The fields follow upstream's `VideoConfigurationView`, `AudioConfigurationView` and
+`ResourceConfigurationView` control for control, spinner bounds included, so a value accepted
+here is one the JavaFX launcher would also accept. Two things deliberately differ: upstream
+encodes "no frame cap" as `maxFramePerSecond = 0` and has nothing else to say it, so here a
+toggle says it and the file keeps the 0; and the numeric fields are editable combo boxes, so
+the common values are one click away without ruling out typing another. Building it needs
+Xcode rather than just the Command Line Tools — SwiftUI's property wrappers are macros and
+the macro plugins ship only with Xcode.
 
 ```bash
 cd launcher && ./build-app.sh
 ```
 
-Produces `launcher/build/BeatorajaLauncher.app` — 260 KB, native arm64. Put it next to
+Produces `launcher/build/BeatorajaLauncher.app` — 656 KB, native arm64. Put it next to
 `beatoraja.app` and it will find the game.
-- `StubScoreDatabaseAccessor` — score database stub, not implemented
-- `AudioBenchmark` — the audio verification above
 
 ### Core fixes
 

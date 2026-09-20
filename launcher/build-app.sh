@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 APP="$HERE/build/BeatorajaLauncher.app"
 BIN="$HERE/.build/release/BeatorajaLauncher"
 
-swift build -c release --build-system native
+swift build -c release
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -27,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>BeatorajaLauncher</string>
   <key>CFBundleIconFile</key><string>launcher.icns</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
