@@ -3,6 +3,7 @@ package com.starxh.beatoraja.desktop;
 import com.badlogic.gdx.ApplicationListener;
 import com.badlogic.gdx.backends.lwjgl3.Lwjgl3Application;
 import com.badlogic.gdx.backends.lwjgl3.Lwjgl3ApplicationConfiguration;
+import com.badlogic.gdx.backends.lwjgl3.Lwjgl3WindowAdapter;
 import com.badlogic.gdx.graphics.glutils.HdpiMode;
 import com.starxh.beatoraja.BeatorajaGame;
 
@@ -33,7 +34,7 @@ public final class DesktopLauncher {
                 + "  java = " + System.getProperty("java.version"));
 
         final Lwjgl3ApplicationConfiguration cfg = new Lwjgl3ApplicationConfiguration();
-        cfg.setTitle("beatoraja (desktop / native)");
+        cfg.setTitle("beatoraja — Apple Silicon");
         cfg.setWindowedMode(1280, 720);
         // macOS 窗口模式下 GLFW 的 swap interval 并不总是生效：60Hz 屏上实测跑出 93~106fps
         // 且帧间隔不均，观感就是"跑不满"的抖动。因此在 vsync 之外再显式限帧。
@@ -56,7 +57,21 @@ public final class DesktopLauncher {
         // 之前 Rosetta 下的 AppleMetalOpenGLRenderer 崩溃属于 LWJGL2 + 2018 年 libGDX 的组合，
         // 原生 arm64 + LWJGL3 是另一套代码路径，先验证 GL20 是否稳定。
 
+        // 点窗口关闭按钮时明确退出。core 里的 ESC 被 Android 的返回键逻辑接管，
+        // 桌面端没有对应处理，不加这个就没有任何可用的退出途径。
+        cfg.setWindowListener(new Lwjgl3WindowAdapter() {
+            @Override
+            public boolean closeRequested() {
+                com.badlogic.gdx.Gdx.app.exit();
+                return true;
+            }
+        });
+
         new Lwjgl3Application(new Bootstrap(root), cfg);
+
+        // beatoraja 会留下若干非守护线程（Java Sound Sequencer、解码线程等），
+        // 主循环退出后它们仍会吊住 JVM，必须显式结束进程。
+        System.exit(0);
     }
 
     /**
