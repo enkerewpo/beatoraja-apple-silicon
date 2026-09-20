@@ -66,6 +66,14 @@ Defaults to `~/Games/beatoraja0.8.8-modernchic`; change `workingDir` in `desktop
 
 Override the frame cap with `-Doraja.fps=120`.
 
+### Scanning the song library
+
+```bash
+./gradlew :desktop:scanSongs
+```
+
+Walks every configured `bmsroot`, parses each chart and rebuilds `songdata.db`. Runs headless, so it is easy to verify on its own. Verified against a database built by beatoraja 0.8.8: all 36 `song` rows match bit for bit on `sha256`, `folder` and `parent`, and every `folder` row agrees.
+
 ### Building a native .app
 
 ```bash
@@ -85,7 +93,8 @@ This was not always true. `SongUtils.crc32` in this fork had picked up two steps
 ### New `desktop/` module
 
 - `DesktopLauncher` — LWJGL3 entry point
-- `JdbcSongDatabaseAccessor` — JDBC song database reader
+- `JdbcSongDatabaseAccessor` — JDBC song database reader and writer
+- `SongScanner` / `ScanTool` — song library scanning, also runnable headless
 - `StubScoreDatabaseAccessor` — score database stub, not implemented
 - `AudioBenchmark` — the audio verification above
 
@@ -105,7 +114,6 @@ This was not always true. `SongUtils.crc32` in this fork had picked up two steps
 ## TODO
 
 - [ ] **Score database** — currently a stub, scores are not saved
-- [ ] **Song scanning** — not implemented
 - [ ] **Config window** — the upstream JavaFX launcher has not been adapted
 - [ ] **Skin switching** — needs in-game verification
 - [ ] **Frame pacing** — vsync is not reliably honoured on macOS in windowed mode; currently capped explicitly

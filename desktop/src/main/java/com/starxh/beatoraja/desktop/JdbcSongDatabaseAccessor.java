@@ -125,7 +125,69 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
 
     @Override
     public void setSongDatas(SongData[] songs) {
-        // writes belong to the scan flow, not implemented
+        if (songs == null || songs.length == 0) {
+            return;
+        }
+        final String sql = "INSERT OR REPLACE INTO song"
+                + " (md5, sha256, title, subtitle, genre, artist, subartist, tag, path, folder,"
+                + "  stagefile, banner, backbmp, preview, parent, level, difficulty, maxbpm, minbpm,"
+                + "  length, mode, judge, feature, content, date, favorite, adddate, notes, charthash)"
+                + " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            final long now = System.currentTimeMillis() / 1000L;
+            for (SongData s : songs) {
+                runner.update(c, sql,
+                        s.getMd5(), s.getSha256(), s.getTitle(), s.getSubtitle(), s.getGenre(),
+                        s.getArtist(), s.getSubartist(), s.getTag(), s.getPath(), s.getFolder(),
+                        s.getStagefile(), s.getBanner(), s.getBackbmp(), s.getPreview(),
+                        s.getParent(), s.getLevel(), s.getDifficulty(), s.getMaxbpm(), s.getMinbpm(),
+                        s.getLength(), s.getMode(), s.getJudge(), s.getFeature(), s.getContent(),
+                        now, s.getFavorite(), now, s.getNotes(), s.getCharthash());
+            }
+            c.commit();
+        } catch (SQLException e) {
+            System.err.println("[desktop] writing songs failed: " + e.getMessage());
+        }
+    }
+
+    /** Insert the directories a scan found, so the select screen can build its tree. */
+    private void writeFolders(java.util.Map<String, String> dirs, String[] bmsroot) {
+        if (dirs == null || dirs.isEmpty()) {
+            return;
+        }
+        final String sql = "INSERT OR REPLACE INTO folder"
+                + " (title, subtitle, command, path, banner, parent, type, date, adddate, max)"
+                + " VALUES (?,?,?,?,?,?,?,?,?,?)";
+        try (Connection c = open()) {
+            c.setAutoCommit(false);
+            final long now = System.currentTimeMillis() / 1000L;
+            for (java.util.Map.Entry<String, String> e : dirs.entrySet()) {
+                final java.io.File dir = new java.io.File(e.getKey());
+                // beatoraja stores folder paths with a trailing separator, and identifies the
+                // parent by the hash of the absolute path above it (see SongScanner).
+                runner.update(c, sql,
+                        e.getValue(), "", "", e.getKey() + java.io.File.separator, "",
+                        bms.player.beatoraja.song.SongUtils.crc32(dir.getParent(), bmsroot, ""),
+                        0, now, now, 0);
+            }
+            c.commit();
+        } catch (SQLException e) {
+            System.err.println("[desktop] writing folders failed: " + e.getMessage());
+        }
+    }
+
+    /** The configured root that a path lives under, or empty if none matches. */
+    private static String matchingRoot(String path, String[] bmsroot) {
+        String best = "";
+        if (bmsroot != null) {
+            for (String r : bmsroot) {
+                if (r != null && path.startsWith(r) && r.length() > best.length()) {
+                    best = r;
+                }
+            }
+        }
+        return best;
     }
 
     @Override
@@ -145,9 +207,23 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
     @Override
     public void updateSongDatas(String updatepath, String[] bmsroot, boolean updateAll,
                                 SongScanProgress progress) {
-        System.out.println("[desktop] song scanning is not implemented; build songdata.db with upstream beatoraja first");
+        final String[] roots = (bmsroot == null || bmsroot.length == 0) ? this.bmsroot : bmsroot;
+        // updatepath narrows the scan to one directory; null means everything
+        final String[] targets = (updatepath == null || updatepath.isEmpty())
+                ? roots : new String[] { updatepath };
+
+        final long t0 = System.nanoTime();
+        final SongScanner scanner = new SongScanner(targets, progress);
+        scanner.scan();
+
+        writeFolders(scanner.getFolders(), roots);
+        setSongDatas(scanner.getSongs().toArray(new SongData[0]));
+
+        System.out.printf("[desktop] scan finished: %d charts, %d folders, %d ms%n",
+                scanner.getSongs().size(), scanner.getFolders().size(),
+                (System.nanoTime() - t0) / 1_000_000L);
         if (progress != null) {
-            progress.onFileScanned(0, 0);
+            progress.onFileScanned(scanner.getSongs().size(), scanner.getSongs().size());
         }
     }
 

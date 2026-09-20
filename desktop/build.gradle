@@ -51,6 +51,15 @@ tasks.named('run', JavaExec) {
     standardInput = System.in
 }
 
+tasks.register('scanSongs', JavaExec) {
+    group = 'application'
+    description = 'Rebuild songdata.db from the configured BMS roots, without starting the game'
+    mainClass = 'com.starxh.beatoraja.desktop.ScanTool'
+    classpath = sourceSets.main.runtimeClasspath
+    workingDir = file(orajaHome)
+    systemProperty 'beatoraja.root', orajaHome
+}
+
 tasks.register('audioBench', JavaExec) {
     group = 'verification'
     description = 'Measure ogg decode time and voice rejection under native arm64'
