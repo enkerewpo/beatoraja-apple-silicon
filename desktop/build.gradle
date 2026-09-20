@@ -1,52 +1,117 @@
-// 桌面端（LWJGL3）模块。
-// 存在的理由：上游 beatoraja 用 libGDX 1.9.9 + LWJGL2，而 LWJGL2 从无也永不会有
-// arm64 macOS 支持；本 fork 的 core 已迁到 libGDX 1.14，只差一个桌面后端。
-plugins { id 'java' }
+// Desktop (LWJGL3) module.
+// Upstream beatoraja uses libGDX 1.9.9 with LWJGL 2, which has never supported arm64 macOS
+// and never will. The core here is already on libGDX 1.14, so only a desktop backend was
+// missing.
+plugins {
+    id 'java'
+    id 'application'
+}
+
+application {
+    mainClass = 'com.starxh.beatoraja.desktop.DesktopLauncher'
+}
 
 sourceSets.main.java.srcDirs = ['src/main/java']
 
 dependencies {
     implementation project(':core')
     implementation "com.badlogicgames.gdx:gdx-backend-lwjgl3:$gdxVersion"
-    // natives-desktop 在 1.14 里已包含 macOS arm64
+    // natives-desktop already ships macOS arm64 in 1.14
     runtimeOnly "com.badlogicgames.gdx:gdx-platform:$gdxVersion:natives-desktop"
     runtimeOnly "com.badlogicgames.gdx:gdx-freetype-platform:$gdxVersion:natives-desktop"
     implementation "com.badlogicgames.gdx-controllers:gdx-controllers-desktop:$gdxControllersVersion"
-    // BGA：VideoPlayerCreator 在桌面端按类名反射查找 com.badlogic.gdx.video.VideoPlayerDesktop，
-    // 该类由官方 gdx-video-lwjgl3 提供（本仓库 vendored 的 gdx-video-core 同为 1.3.4，接口一致）。
+    // BGA: VideoPlayerCreator looks up com.badlogic.gdx.video.VideoPlayerDesktop by name on
+    // desktop. That class comes from the official gdx-video-lwjgl3; the vendored
+    // gdx-video-core here is the same 1.3.4, so the interfaces match.
     implementation "com.badlogicgames.gdx-video:gdx-video-lwjgl3:$gdxVideoVersion"
     implementation 'org.xerial:sqlite-jdbc:3.50.1.0'
-    // 移植过来的 JDBC accessor 用 commons-dbutils 做 ResultSet 映射（core 也依赖它）
+    // the JDBC accessor maps ResultSets with commons-dbutils (core depends on it too)
     implementation 'commons-dbutils:commons-dbutils:1.8.1'
 }
 
-tasks.register('run', JavaExec) {
-    group = 'application'
-    mainClass = 'com.starxh.beatoraja.desktop.DesktopLauncher'
-    classpath = sourceSets.main.runtimeClasspath
-    standardInput = System.in
-    // 在现有 beatoraja 安装目录下运行，才能读到 config.json / skin / songdata.db
-    // 音游对 GC 停顿极其敏感：载入上千个键音后进入游玩，G1 的一次回收就会掉帧。
-    // ZGC 是亚毫秒停顿的并发收集器，正适合这种场景。堆预先开大，避免运行中扩容。
-    jvmArgs '-Xms2g', '-Xmx4g', '-XX:+UseZGC'
-    def orajaHome = System.getProperty('user.home') + '/Games/beatoraja0.8.8-modernchic'
+// GLFW requires the first thread of the process on macOS. The lwjgl3 backend in libGDX
+// 1.14 does not ship StartOnFirstThreadHelper, so the flag has to be passed explicitly.
+// Note this deadlocks the upstream JavaFX config window; this module is pure LWJGL3.
+def macJvmArgs = org.gradle.internal.os.OperatingSystem.current().isMacOsX()
+        ? ['-XstartOnFirstThread'] : []
+
+// Rhythm games are very sensitive to GC pauses: a single G1 collection right after loading
+// a thousand keysounds drops frames. ZGC is a concurrent collector with sub-millisecond
+// pauses. Size the heap up front so it never has to grow mid-play.
+def gameJvmArgs = macJvmArgs + ['-Xms2g', '-Xmx4g', '-XX:+UseZGC']
+
+def orajaHome = System.getProperty('user.home') + '/Games/beatoraja0.8.8-modernchic'
+
+// the application plugin already creates a run task; configure it instead of adding one
+tasks.named('run', JavaExec) {
+    jvmArgs = gameJvmArgs
+    // run inside an existing beatoraja install so config.json / skin / songdata.db resolve
     workingDir = file(orajaHome)
     systemProperty 'beatoraja.root', orajaHome
-    // macOS 上 GLFW 要求在进程的第一个线程运行。libGDX 1.14 的 lwjgl3 后端
-    // 并不自带 StartOnFirstThreadHelper，必须显式传这个 JVM 参数。
-    // 注意：上游那套 JavaFX 配置窗口不能加此参数（会死锁），但本模块是纯 LWJGL3，无此冲突。
-    if (org.gradle.internal.os.OperatingSystem.current().isMacOsX()) {
-        jvmArgs '-XstartOnFirstThread'
-    }
+    standardInput = System.in
 }
 
 tasks.register('audioBench', JavaExec) {
     group = 'verification'
-    description = '在原生 arm64 下测量 ogg 切片的解码加载耗时与并发发音丢声情况'
+    description = 'Measure ogg decode time and voice rejection under native arm64'
     mainClass = 'com.starxh.beatoraja.desktop.AudioBenchmark'
     classpath = sourceSets.main.runtimeClasspath
-    if (org.gradle.internal.os.OperatingSystem.current().isMacOsX()) {
-        jvmArgs '-XstartOnFirstThread'
-    }
+    jvmArgs = macJvmArgs
     systemProperty 'oraja.songdir', project.findProperty('oraja.songdir') ?: ''
+}
+
+// Build a macOS .app with an embedded JRE via jpackage - double-click to run, no system Java.
+tasks.register('packageApp', Exec) {
+    group = 'distribution'
+    description = 'Package a native macOS .app'
+    dependsOn 'installDist'
+
+    def outDir = layout.buildDirectory.dir('jpackage').get().asFile
+    def input = layout.buildDirectory.dir('install/desktop/lib').get().asFile
+    def icon = file('packaging/beatoraja.icns')
+
+    doFirst {
+        outDir.deleteDir()
+        outDir.mkdirs()
+        // The main jar carries a version (desktop-<version>.jar) so it cannot be hardcoded;
+        // --main-jar is relative to the input directory
+        def mainJar = input.listFiles().find { it.name.startsWith('desktop-') && it.name.endsWith('.jar') }
+        if (mainJar == null) throw new GradleException("no desktop-*.jar under ${input}")
+        args = args.collect { it == '@MAIN_JAR@' ? mainJar.name : it }
+    }
+
+    commandLine 'jpackage',
+            '--type', 'app-image',
+            '--name', 'beatoraja',
+            '--app-version', '1.0.0',  // macOS rejects a leading zero; upstream version goes in vendor
+            '--vendor', 'beatoraja 0.8.8 — Apple Silicon port',
+            '--icon', icon.absolutePath,
+            '--input', input.absolutePath,
+            '--main-jar', '@MAIN_JAR@',
+            '--main-class', 'com.starxh.beatoraja.desktop.DesktopLauncher',
+            '--dest', outDir.absolutePath,
+            // The default runtime image has bin/java stripped, but this bundle calls java
+            // itself (see packaging/launcher.sh), so keep a full JDK.
+            '--runtime-image', System.getProperty('java.home'),
+            // Baked in because Finder starts the app without a shell to pass them
+            '--java-options', '-XstartOnFirstThread',
+            '--java-options', '-Xms2g',
+            '--java-options', '-Xmx4g',
+            '--java-options', '-XX:+UseZGC',
+            '--mac-package-identifier', 'dev.wheatfox.beatoraja'
+
+    // jpackage cannot set a working directory and Finder starts apps with CWD=/, while
+    // libGDX caches the real CWD when Gdx.files loads, so changing user.dir afterwards does
+    // not help and relative font and skin paths all miss. See packaging/launcher.sh.
+    doLast {
+        // Use our own script as the bundle entry point rather than renaming the jpackage
+        // launcher; it calls the bundled JRE. Reasons in packaging/launcher.sh.
+        def macos = new File(outDir, 'beatoraja.app/Contents/MacOS')
+        copy {
+            from file('packaging/launcher.sh')
+            into macos
+            rename { 'beatoraja' }
+        }
+        new File(macos, 'beatoraja').setExecutable(true)
+    }
 }

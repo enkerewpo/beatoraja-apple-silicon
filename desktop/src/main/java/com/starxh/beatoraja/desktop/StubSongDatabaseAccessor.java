@@ -5,11 +5,7 @@ import bms.player.beatoraja.song.SongData;
 import bms.player.beatoraja.song.SongDatabaseAccessor;
 
 /**
- * 临时桩件：让桌面端启动路径先跑通，用于验证 LWJGL3 后端在 Apple Silicon 上能否原生开窗渲染。
- *
- * 真正的实现要从上游 exch-bms2/beatoraja 的 SQLiteSongDatabaseAccessor（约 1500 行 JDBC）
- * 移植过来，并补上本 fork 新增的 updateSongTail 与 SongScanProgress 回调。
- * 两边同为 GPL-3.0，移植合规。
+ * Temporary stub, kept only as a fallback. The real reader is JdbcSongDatabaseAccessor.
  */
 final class StubSongDatabaseAccessor implements SongDatabaseAccessor {
 
@@ -38,12 +34,12 @@ final class StubSongDatabaseAccessor implements SongDatabaseAccessor {
 
     @Override
     public void setSongDatas(SongData[] songs) {
-        // 桩件不持久化
+        // stub, nothing is persisted
     }
 
     @Override
     public void updateSongTail(String sha256, int tail) {
-        // 桩件不持久化
+        // stub, nothing is persisted
     }
 
     @Override
@@ -58,12 +54,12 @@ final class StubSongDatabaseAccessor implements SongDatabaseAccessor {
 
     @Override
     public void updateSongDatas(String updatepath, String[] bmsroot, boolean updateAll) {
-        System.out.println("[desktop] 曲库扫描未实现（桩件）");
+        System.out.println("[desktop] song scanning is not implemented (stub)");
     }
 
     @Override
     public void updateSongDatas(String updatepath, String[] bmsroot, boolean updateAll, SongScanProgress progress) {
-        System.out.println("[desktop] 曲库扫描未实现（桩件）");
+        System.out.println("[desktop] song scanning is not implemented (stub)");
         if (progress != null) {
             progress.onFileScanned(0, 0);
         }

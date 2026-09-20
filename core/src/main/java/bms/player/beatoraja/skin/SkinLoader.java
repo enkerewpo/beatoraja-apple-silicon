@@ -137,10 +137,11 @@ public abstract class SkinLoader {
     public static File getPath(String imagepath, ObjectMap<String, String> filemap) {
         imagepath = imagepath.replace("\\", "/").replaceAll("/+", "/");
         // 只对非绝对路径去除前导 /，保留 Android 上的绝对路径
-        // [desktop] 原实现把「绝对路径」等同于以 /storage/ 或 /Android/ 开头（Android 的根），
-        // 于是 macOS/Linux 的 /Users、/home 会被剥掉前导斜杠、退化成相对路径，
-        // 再按 CWD 解析就产生了根目录翻倍、纹理全部加载失败（表现为黑屏）。
-        // 这里限定该修正只在 Android 上生效，桌面端保留真实绝对路径。
+        // [desktop] This used to treat "absolute" as starting with /storage/ or /Android/
+        // (the Android roots), so /Users and /home on macOS and Linux lost their leading
+        // slash, degraded into relative paths, and resolved against the CWD - doubling the
+        // root and failing every texture load, which shows up as a black screen.
+        // Restrict the fixup to Android; desktop keeps real absolute paths.
         boolean androidPlatform = com.badlogic.gdx.Gdx.app != null
                 && com.badlogic.gdx.Gdx.app.getType() == com.badlogic.gdx.Application.ApplicationType.Android;
         if (androidPlatform && imagepath.startsWith("/")
@@ -403,13 +404,15 @@ public abstract class SkinLoader {
     }
 
     /**
-     * 把路径规范化为绝对路径。
+     * Normalise a path to an absolute one.
      *
-     * [desktop] 原实现用「输入是否以 / 开头」决定输出要不要加前导斜杠，
-     * 但中间已经用 getCanonicalPath() 把相对路径解析成了绝对路径，
-     * 于是相对路径进去、少一个斜杠的绝对路径出来（如 Users/... 而非 /Users/...），
-     * 再被当作相对路径按 CWD 解析，导致根目录翻倍、皮肤纹理全部加载失败（黑屏）。
-     * getCanonicalPath() 本身已处理 .. 与符号链接并给出正确的绝对路径，直接用即可。
+     * [desktop] This used to decide whether to prepend a leading slash from whether the
+     * *input* was absolute, but getCanonicalPath() had already turned a relative path into
+     * an absolute one. A relative path went in and an absolute path missing its leading
+     * slash came out (Users/... instead of /Users/...), which was then resolved against the
+     * CWD, doubling the root and failing every skin texture load - a black screen.
+     * getCanonicalPath() already resolves .. and symlinks and yields a correct absolute
+     * path, so just return it.
      */
     public static String normalizePath(String path) {
         if (path == null || path.isEmpty()) return path;

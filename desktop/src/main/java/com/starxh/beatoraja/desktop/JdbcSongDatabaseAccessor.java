@@ -15,16 +15,15 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 桌面端的 JDBC 曲库读取实现。
+ * JDBC song database reader for desktop.
  *
- * 为什么不直接移植上游 exch-bms2 的 SQLiteSongDatabaseAccessor（1542 行）：
- * 本 fork 的 core 为适配 Android 移除了 SongReview、SongArchive 自动解压、
- * SongInformationAccessor 等一批功能，上游那份对它们有 112 处引用。
- * 在别人的大文件上切除 36 处功能引用，既费时又容易在扫描逻辑上留下暗伤。
+ * Upstream's SQLiteSongDatabaseAccessor (1542 lines) was not ported directly: the core here
+ * dropped SongReview, SongArchive extraction and SongInformationAccessor for the Android
+ * port, and upstream's file references them in 112 places. Cutting 36 feature sites out of
+ * someone else's large file is slow and risks leaving subtle damage in the scan logic.
  *
- * 这里只实现接口要求的读取路径，直接对接 beatoraja 既有的 songdata.db
- * （表结构与上游一致：song / folder）。曲库扫描暂未实现——现阶段用既有数据库
- * 验证渲染与音频链路即可，扫描属于后续工作。
+ * This implements only the read paths the interface requires, against beatoraja's existing
+ * songdata.db (same schema as upstream: song / folder). Song scanning is not implemented.
  */
 final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
 
@@ -51,14 +50,14 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
                     new SQLiteDatabaseAccessor.AndroidBeanListHandler<>(SongData.class), params);
             return list == null ? NO_SONGS : list.toArray(new SongData[0]);
         } catch (SQLException e) {
-            System.err.println("[desktop] 曲库查询失败: " + e.getMessage() + "  sql=" + sql);
+            System.err.println("[desktop] song query failed: " + e.getMessage() + "  sql=" + sql);
             return NO_SONGS;
         }
     }
 
     @Override
     public SongData[] getSongDatas(String key, String value) {
-        // key 来自 core 内部的固定列名，不是用户输入
+        // key is a fixed column name from core, never user input
         return query("SELECT * FROM song WHERE " + key + " = ?", value);
     }
 
@@ -76,7 +75,7 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
         for (int i = 0; i < hashes.length; i++) {
             in.append(i == 0 ? "?" : ",?");
         }
-        // 谱面既可能按 sha256 也可能按 md5 索引
+        // charts may be indexed by sha256 or by md5
         String sql = "SELECT * FROM song WHERE sha256 IN (" + in + ") OR md5 IN (" + in + ")";
         Object[] params = new Object[hashes.length * 2];
         System.arraycopy(hashes, 0, params, 0, hashes.length);
@@ -86,9 +85,9 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
 
     @Override
     public SongData[] getSongDatas(String sql, String score, String scorelog) {
-        // 注意：传进来的是 WHERE 子句片段而非完整 SQL，例如
-        //   "playcount > 0 ORDER BY playcount DESC LIMIT 10" 或 "favorite & 1 != 0"。
-        // 其中 playcount 等列位于成绩库，需要先 ATTACH 才能联查。
+        // Note: what arrives is a WHERE fragment, not a full statement, e.g.
+        //   "playcount > 0 ORDER BY playcount DESC LIMIT 10" or "favorite & 1 != 0".
+        // Columns like playcount live in the score database and need an ATTACH first.
         try (Connection c = open()) {
             if (score != null && !score.isEmpty()) {
                 runner.update(c, "ATTACH DATABASE ? AS score", score);
@@ -100,7 +99,7 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
                     new SQLiteDatabaseAccessor.AndroidBeanListHandler<>(SongData.class));
             return list == null ? NO_SONGS : list.toArray(new SongData[0]);
         } catch (SQLException e) {
-            // 引用了成绩库列而当前没有成绩库时会走到这里，属预期情况，降级为空结果
+            // expected when the fragment references score columns and no score DB exists
             return NO_SONGS;
         }
     }
@@ -119,14 +118,14 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
                     new SQLiteDatabaseAccessor.AndroidBeanListHandler<>(FolderData.class), value);
             return list == null ? NO_FOLDERS : list.toArray(new FolderData[0]);
         } catch (SQLException e) {
-            System.err.println("[desktop] 文件夹查询失败: " + e.getMessage());
+            System.err.println("[desktop] folder query failed: " + e.getMessage());
             return NO_FOLDERS;
         }
     }
 
     @Override
     public void setSongDatas(SongData[] songs) {
-        // 写入属于扫描流程，暂未实现
+        // writes belong to the scan flow, not implemented
     }
 
     @Override
@@ -134,7 +133,7 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
         try (Connection c = open()) {
             runner.update(c, "UPDATE song SET feature = feature WHERE sha256 = ?", sha256);
         } catch (SQLException e) {
-            // 非关键路径，忽略
+            // not on a critical path, ignore
         }
     }
 
@@ -146,7 +145,7 @@ final class JdbcSongDatabaseAccessor implements SongDatabaseAccessor {
     @Override
     public void updateSongDatas(String updatepath, String[] bmsroot, boolean updateAll,
                                 SongScanProgress progress) {
-        System.out.println("[desktop] 曲库扫描尚未实现；请先用上游 beatoraja 0.8.8 建好 songdata.db");
+        System.out.println("[desktop] song scanning is not implemented; build songdata.db with upstream beatoraja first");
         if (progress != null) {
             progress.onFileScanned(0, 0);
         }

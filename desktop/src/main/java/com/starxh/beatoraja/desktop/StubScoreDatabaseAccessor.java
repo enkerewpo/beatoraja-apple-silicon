@@ -12,13 +12,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 临时桩件：成绩数据库。
+ * Score database stub. Scores are not persisted yet.
  *
- * 与 {@link StubSongDatabaseAccessor} 同理，用于先打通桌面端启动路径。
- * 真正的实现要从上游 exch-bms2/beatoraja 的 SQLiteScoreDatabaseAccessor 移植
- * （core 里已有 SQLiteDatabaseAccessor 提供 JDBC 基础设施可复用）。
+ * A real implementation would port upstream's SQLiteScoreDatabaseAccessor; core already
+ * provides SQLiteDatabaseAccessor with the JDBC plumbing to build on.
  *
- * 注意 getPlayerData() 不能返回 null —— MusicSelector.create() 会直接解引用。
+ * getPlayerData() must not return null - MusicSelector.create() dereferences it directly.
  */
 final class StubScoreDatabaseAccessor extends ScoreDatabaseAccessor {
 
@@ -27,7 +26,7 @@ final class StubScoreDatabaseAccessor extends ScoreDatabaseAccessor {
 
     @Override
     public void createTable() {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
@@ -49,7 +48,7 @@ final class StubScoreDatabaseAccessor extends ScoreDatabaseAccessor {
 
     @Override
     public void getScoreDatas(ScoreDataCollector collector, SongData[] songs, int mode) {
-        // 无成绩可回调
+        // no scores to report
     }
 
     @Override
@@ -59,17 +58,17 @@ final class StubScoreDatabaseAccessor extends ScoreDatabaseAccessor {
 
     @Override
     public void setScoreData(ScoreData[] scores) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
     public void setScoreData(Map<String, Map<String, Object>> map) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
     public void deleteScoreData(String sha256, int mode) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
@@ -84,16 +83,16 @@ final class StubScoreDatabaseAccessor extends ScoreDatabaseAccessor {
 
     @Override
     public void setPlayerData(PlayerData pd) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
     public void setScoreLog(ScoreLog log) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 
     @Override
     public void setScoreDataLog(ScoreData[] scores) {
-        // 桩件无持久化
+        // stub, nothing is persisted
     }
 }

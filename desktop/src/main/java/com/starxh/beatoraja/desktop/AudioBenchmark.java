@@ -12,16 +12,17 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 音频验证：这次移植的全部意义就是音频。
+ * Audio verification - the whole point of this port.
  *
- * Rosetta + libGDX 1.9.9 下，1572 个 Vorbis 切片解码要 2~3 分钟，而曲子本身只有 2 分 04 秒，
- * 结果是「歌放完了键音还没解出来」——表现为掉音和卡顿（上游 issue #851，至今未解）。
+ * Under Rosetta with libGDX 1.9.9, decoding 1572 Vorbis slices takes 2-3 minutes while the
+ * chart itself is only 124 seconds long, so the song ends before its keysounds finish
+ * loading. That shows up as dropped notes and stutter (upstream issue #851, still open).
  *
- * 本测试在原生 arm64 + libGDX 1.14 + LWJGL3 OpenAL 下测量：
- *   1. 全部切片的解码加载耗时（对比曲长，判断能否跟上）
- *   2. 密集并发播放时是否有声部被丢弃
+ * This measures, on native arm64 with libGDX 1.14 and LWJGL3 OpenAL:
+ *   1. how long decoding every slice takes, against the chart length
+ *   2. whether voices get rejected under dense concurrent playback
  *
- * 用法：./gradlew :desktop:audioBench -Poraja.songdir=<含 .ogg 的谱面目录>
+ * Usage: ./gradlew :desktop:audioBench -Poraja.songdir=<directory containing .ogg files>
  */
 public final class AudioBenchmark {
 
@@ -31,7 +32,7 @@ public final class AudioBenchmark {
     public static void main(String[] args) {
         final String dir = System.getProperty("oraja.songdir");
         if (dir == null) {
-            System.err.println("需要 -Doraja.songdir=<谱面目录>");
+            System.err.println("need -Doraja.songdir=<chart directory>");
             System.exit(2);
         }
 
@@ -58,17 +59,17 @@ public final class AudioBenchmark {
         @Override
         public void create() {
             System.out.println("[bench] os.arch = " + System.getProperty("os.arch")
-                    + "  (Rosetta 下会是 x86_64)");
-            System.out.println("[bench] 目录 = " + dir);
+                    + "  (would read x86_64 under Rosetta)");
+            System.out.println("[bench] directory = " + dir);
 
             final File[] files = dir.listFiles((d, n) -> n.toLowerCase().endsWith(".ogg"));
             if (files == null || files.length == 0) {
-                System.out.println("[bench] 目录下没有 .ogg");
+                System.out.println("[bench] no .ogg files in that directory");
                 Gdx.app.exit();
                 return;
             }
 
-            System.out.println("[bench] 切片数 = " + files.length + "，开始解码加载…");
+            System.out.println("[bench] slices = " + files.length + ", decoding...");
             final long t0 = System.nanoTime();
             for (File f : files) {
                 try {
@@ -79,25 +80,26 @@ public final class AudioBenchmark {
             }
             loadMillis = (System.nanoTime() - t0) / 1_000_000L;
 
-            System.out.printf("[bench] 加载完成：%d 个成功 / %d 个失败，耗时 %d ms（平均 %.1f ms/个）%n",
+            System.out.printf("[bench] loaded %d ok / %d failed in %d ms (%.1f ms each)%n",
                     sounds.size(), failed, loadMillis, loadMillis / (double) Math.max(files.length, 1));
-            System.out.println("[bench] 参考：Katakoi Echo 曲长 124 秒。加载耗时若远小于曲长，则不会掉音。");
+            System.out.println("[bench] reference: Katakoi Echo runs 124 s. Load time far below that means no dropouts.");
         }
 
         @Override
         public void render() {
-            // 前若干帧密集触发，模拟高密度谱面的并发发音
+            // Fire densely for the first frames, simulating a high-density chart
             if (frame < 240 && !sounds.isEmpty()) {
                 for (int i = 0; i < 8; i++) {
                     final Sound s = sounds.get((frame * 8 + i) % sounds.size());
-                    if (s.play(0.25f) == -1) {
+                    // volume 0: voice allocation is what matters, no need to make noise
+                    if (s.play(0f) == -1) {
                         failed++;
                     }
                 }
             }
             if (frame == 240) {
-                System.out.println("[bench] 并发播放 1920 次触发完成，被拒绝的发音数 = " + failed);
-                System.out.println("[bench] 若为 0，说明声部数充足、没有丢声。");
+                System.out.println("[bench] 1920 concurrent triggers done, voices rejected = " + failed);
+                System.out.println("[bench] zero means the voice count is sufficient and nothing was dropped.");
             }
             if (frame > 300) {
                 Gdx.app.exit();

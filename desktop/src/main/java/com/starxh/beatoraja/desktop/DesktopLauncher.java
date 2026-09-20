@@ -15,12 +15,13 @@ import bms.player.beatoraja.PlayerConfig;
 import java.io.File;
 
 /**
- * 桌面端启动入口（LWJGL3）。
+ * Desktop entry point (LWJGL3).
  *
- * 为什么需要它：上游 beatoraja 用 libGDX 1.9.9 + LWJGL2 启动，而 LWJGL2 从来没有、
- * 也永远不会有 arm64 macOS 支持——在 Apple Silicon 上只能靠 Rosetta 跑 x86_64，
- * 结果是苹果 OpenGL-over-Metal 转译层在纹理路径上段错误，且 Vorbis 解码跟不上导致掉音。
- * 本 fork 的 core 已迁到 libGDX 1.14（后端无关），补一个 LWJGL3 后端即可原生运行。
+ * Upstream beatoraja boots through libGDX 1.9.9 with the LWJGL 2 backend, and LWJGL 2 has
+ * never supported arm64 macOS and never will. On Apple Silicon that leaves only Rosetta and
+ * x86_64, where Apple's OpenGL-over-Metal layer segfaults on the texture path and Vorbis
+ * decoding cannot keep up with playback, dropping keysounds. The core in this repository is
+ * already on libGDX 1.14 and backend-agnostic, so a LWJGL3 backend is all that is needed.
  */
 public final class DesktopLauncher {
 
@@ -28,7 +29,15 @@ public final class DesktopLauncher {
     }
 
     public static void main(String[] args) {
-        final File root = new File(System.getProperty("beatoraja.root", ".")).getAbsoluteFile();
+        final File root = resolveRoot();
+        // Once packaged as a .app and started from Finder the working directory is /, and
+        // core resolves plenty of paths relatively (config.json, font/VL-Gothic-Regular.ttf,
+        // skin/...). Java cannot chdir, so tell core where the root is and keep user.dir in
+        // sync; the .app launch script additionally cd's before starting the JVM.
+        System.setProperty("beatoraja.root", root.getAbsolutePath());
+        System.setProperty("user.dir", root.getAbsolutePath());
+        Config.updateConfigPath();
+
         System.out.println("[desktop] root = " + root);
         System.out.println("[desktop] os.arch = " + System.getProperty("os.arch")
                 + "  java = " + System.getProperty("java.version"));
@@ -36,29 +45,31 @@ public final class DesktopLauncher {
         final Lwjgl3ApplicationConfiguration cfg = new Lwjgl3ApplicationConfiguration();
         cfg.setTitle("beatoraja — Apple Silicon");
         cfg.setWindowedMode(1280, 720);
-        // macOS 窗口模式下 GLFW 的 swap interval 并不总是生效：60Hz 屏上实测跑出 93~106fps
-        // 且帧间隔不均，观感就是"跑不满"的抖动。因此在 vsync 之外再显式限帧。
+        // GLFW's swap interval is not reliably honoured in windowed mode on macOS: a 60Hz
+        // display measured 93-106fps with uneven frame pacing, which reads as judder. Cap
+        // the rate explicitly on top of vsync.
         cfg.useVsync(true);
         cfg.setForegroundFPS(Integer.getInteger("oraja.fps", 60));
 
-        // libGDX 的 OpenAL 默认只有 16 个并发声部，高密度谱面必然丢键音。
-        // beatoraja 自己的 audio.deviceSimultaneousSources 只作用于它的上层逻辑，
-        // 真正的硬上限在这里，必须显式放开。
+        // libGDX defaults to 16 simultaneous OpenAL sources, which drops keysounds on dense
+        // charts. beatoraja's own audio.deviceSimultaneousSources only affects its upper
+        // layer; this is the hard limit and it has to be raised explicitly.
         final int[] audio = readAudioConfig(root);
         cfg.setAudioConfig(audio[0], audio[1], 9);
-        System.out.println("[desktop] OpenAL 声部=" + audio[0] + " 缓冲=" + audio[1]);
-        // Retina 上 LWJGL3 的帧缓冲是逻辑窗口的 2 倍，而皮肤按逻辑尺寸绘制，
-        // 默认 HdpiMode.Pixels 会让整个界面缩在左下角（GL 原点在左下）。
-        // 改用 Logical，让 Gdx.graphics 报告逻辑像素，界面铺满窗口。
-        cfg.setHdpiMode(HdpiMode.Logical);
-        // 用默认的 GL20（macOS 兼容 profile 2.1）。
-        // 曾试过 GL32 core profile，但 libGDX 与 beatoraja 的着色器都是 GLSL 1.20 语法
-        // （varying/attribute），在 core profile 下非法，SpriteBatch 直接编译失败。
-        // 之前 Rosetta 下的 AppleMetalOpenGLRenderer 崩溃属于 LWJGL2 + 2018 年 libGDX 的组合，
-        // 原生 arm64 + LWJGL3 是另一套代码路径，先验证 GL20 是否稳定。
+        System.out.println("[desktop] OpenAL sources=" + audio[0] + " buffer=" + audio[1]);
 
-        // 点窗口关闭按钮时明确退出。core 里的 ESC 被 Android 的返回键逻辑接管，
-        // 桌面端没有对应处理，不加这个就没有任何可用的退出途径。
+        // On Retina the LWJGL3 framebuffer is 2x the logical window while skins draw in
+        // logical units; the default HdpiMode.Pixels leaves the UI in the bottom-left corner
+        // (the GL origin). Logical makes Gdx.graphics report logical pixels.
+        cfg.setHdpiMode(HdpiMode.Logical);
+
+        // Stay on the default GL20 profile. A GL 3.2 core profile was tried, but both libGDX
+        // and beatoraja shaders use GLSL 1.20 syntax (varying/attribute), which is illegal
+        // there and fails SpriteBatch compilation outright.
+
+        // Quit when the window close button is used. ESC is consumed by the Android back-key
+        // logic inherited from the Android port and has no desktop equivalent, so without
+        // this there is no way to quit at all.
         cfg.setWindowListener(new Lwjgl3WindowAdapter() {
             @Override
             public boolean closeRequested() {
@@ -69,15 +80,45 @@ public final class DesktopLauncher {
 
         new Lwjgl3Application(new Bootstrap(root), cfg);
 
-        // beatoraja 会留下若干非守护线程（Java Sound Sequencer、解码线程等），
-        // 主循环退出后它们仍会吊住 JVM，必须显式结束进程。
+        // beatoraja leaves non-daemon threads behind (Java Sound Sequencer, decoder threads)
+        // that keep the JVM alive after the main loop returns, so end the process explicitly.
         System.exit(0);
     }
 
     /**
-     * 只为音频参数做一次极简读取：这些值必须在 Lwjgl3Application 构造前就确定，
-     * 而 core 的 Config.read() 依赖 Gdx.files/Gdx.app，那时还不可用。
-     * 返回 {声部数, 缓冲大小}。
+     * Locate the beatoraja installation directory.
+     *
+     * Inside a .app the working directory is unpredictable (Finder usually gives /), so the
+     * CWD alone is not enough. Order: -Dbeatoraja.root, then the CWD if it looks like an
+     * installation, then the usual locations.
+     */
+    private static File resolveRoot() {
+        final String explicit = System.getProperty("beatoraja.root");
+        if (explicit != null && !explicit.isEmpty()) {
+            return new File(explicit).getAbsoluteFile();
+        }
+        final File cwd = new File(".").getAbsoluteFile();
+        if (new File(cwd, "skin").isDirectory()) {
+            return cwd;
+        }
+        final String home = System.getProperty("user.home");
+        final File[] guesses = {
+            new File(home, "Games/beatoraja0.8.8-modernchic"),
+            new File(home, "Games/beatoraja"),
+            new File(home, "beatoraja"),
+        };
+        for (File g : guesses) {
+            if (new File(g, "skin").isDirectory()) {
+                return g;
+            }
+        }
+        return cwd;
+    }
+
+    /**
+     * Minimal read of the audio settings only. These have to be known before the
+     * Lwjgl3Application is constructed, while core's Config.read() needs Gdx.files and
+     * Gdx.app, neither of which exists yet. Returns {sources, bufferSize}.
      */
     private static int[] readAudioConfig(File root) {
         int sources = 256;
@@ -89,13 +130,13 @@ public final class DesktopLauncher {
                 sources = readInt(t, "deviceSimultaneousSources", sources);
                 buffer = readInt(t, "deviceBufferSize", buffer);
             } catch (Exception e) {
-                System.err.println("[desktop] 读取音频配置失败，使用默认值: " + e);
+                System.err.println("[desktop] failed to read audio config, using defaults: " + e);
             }
         }
         return new int[] { sources, buffer };
     }
 
-    /** 从 JSON 文本里取一个整数字段，取不到就返回默认值。只用于启动前的少量参数。 */
+    /** Pull one integer field out of JSON text, falling back if absent. Startup values only. */
     private static int readInt(String json, String key, int fallback) {
         final java.util.regex.Matcher m = java.util.regex.Pattern
                 .compile("\"" + key + "\"\\s*:\\s*(\\d+)")
@@ -104,9 +145,10 @@ public final class DesktopLauncher {
     }
 
     /**
-     * 配置读取必须发生在 Application 生命周期内：core 的 Config.read() 依赖 Gdx.files 取文件、
-     * 依赖 Gdx.app 记日志，两者都要等 Lwjgl3Application 构造完才可用。
-     * 因此这里先以壳启动，在 create() 里读配置、装数据库实现，再委托给真正的 BeatorajaGame。
+     * Config has to be read inside the Application lifecycle: core's Config.read() reads
+     * through Gdx.files and logs through Gdx.app, and both only exist once Lwjgl3Application
+     * has been constructed. So start with a shell that reads the config, installs the
+     * database implementations, and then delegates to the real BeatorajaGame.
      */
     private static final class Bootstrap implements ApplicationListener {
 
@@ -124,15 +166,16 @@ public final class DesktopLauncher {
             final String name = config.getPlayername() == null ? "player1" : config.getPlayername();
             final PlayerConfig player = PlayerConfig.readPlayerConfig(name, null);
 
-            // core 的 MainLoader 只保留注入点，具体实现由各平台提供。
-            // 用独立的数据库文件：上游 beatoraja 0.8.8 与本 fork 的 SongUtils.crc32 约定不同
-            // （同一目录算出的 CRC 不一致），共用一个库会导致目录层级对不上、曲目全部消失。
-            // 这里读迁移过 CRC 的副本，原 songdata.db 保持不动，两者可共存。
+            // core's MainLoader only keeps the injection points; each platform supplies the
+            // implementation. Use a separate database file: upstream beatoraja 0.8.8 and this
+            // fork disagree on SongUtils.crc32, so the same directory hashes differently and
+            // sharing one database makes the hierarchy mismatch and every chart vanish.
             File db = new File(root, "songdata-desktop.db");
-            if (!db.exists()) db = new File(root, "songdata.db");
-            final String dbPath = db.getAbsolutePath();
+            if (!db.exists()) {
+                db = new File(root, "songdata.db");
+            }
             MainLoader.setSongDatabaseAccessor(
-                    new JdbcSongDatabaseAccessor(dbPath, config.getBmsroot()));
+                    new JdbcSongDatabaseAccessor(db.getAbsolutePath(), config.getBmsroot()));
             bms.player.beatoraja.ScoreDatabaseAccessor.setFactory(
                     path -> new StubScoreDatabaseAccessor());
 
@@ -145,7 +188,7 @@ public final class DesktopLauncher {
             if (game != null) {
                 game.render();
             }
-            // 帧率采样：每 5 秒打一次，便于定位渲染瓶颈
+            // Frame rate sample every five seconds, to locate rendering bottlenecks.
             final long now = System.currentTimeMillis();
             if (now - lastFpsLog > 5000) {
                 lastFpsLog = now;
