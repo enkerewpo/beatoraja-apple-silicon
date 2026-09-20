@@ -137,7 +137,14 @@ public abstract class SkinLoader {
     public static File getPath(String imagepath, ObjectMap<String, String> filemap) {
         imagepath = imagepath.replace("\\", "/").replaceAll("/+", "/");
         // 只对非绝对路径去除前导 /，保留 Android 上的绝对路径
-        if (imagepath.startsWith("/") && !imagepath.startsWith("/storage/") && !imagepath.startsWith("/Android/")) {
+        // [desktop] 原实现把「绝对路径」等同于以 /storage/ 或 /Android/ 开头（Android 的根），
+        // 于是 macOS/Linux 的 /Users、/home 会被剥掉前导斜杠、退化成相对路径，
+        // 再按 CWD 解析就产生了根目录翻倍、纹理全部加载失败（表现为黑屏）。
+        // 这里限定该修正只在 Android 上生效，桌面端保留真实绝对路径。
+        boolean androidPlatform = com.badlogic.gdx.Gdx.app != null
+                && com.badlogic.gdx.Gdx.app.getType() == com.badlogic.gdx.Application.ApplicationType.Android;
+        if (androidPlatform && imagepath.startsWith("/")
+                && !imagepath.startsWith("/storage/") && !imagepath.startsWith("/Android/")) {
             imagepath = imagepath.substring(1);
         }
 
@@ -395,41 +402,26 @@ public abstract class SkinLoader {
         return null;
     }
 
+    /**
+     * 把路径规范化为绝对路径。
+     *
+     * [desktop] 原实现用「输入是否以 / 开头」决定输出要不要加前导斜杠，
+     * 但中间已经用 getCanonicalPath() 把相对路径解析成了绝对路径，
+     * 于是相对路径进去、少一个斜杠的绝对路径出来（如 Users/... 而非 /Users/...），
+     * 再被当作相对路径按 CWD 解析，导致根目录翻倍、皮肤纹理全部加载失败（黑屏）。
+     * getCanonicalPath() 本身已处理 .. 与符号链接并给出正确的绝对路径，直接用即可。
+     */
     public static String normalizePath(String path) {
         if (path == null || path.isEmpty()) return path;
-        // Strip leading ./ (Windows-style current-directory prefix) so it doesn't
-        // cause the path to be treated as relative when it's actually absolute
         String cleanPath = path.replace("\\", "/");
         while (cleanPath.startsWith("./")) {
             cleanPath = cleanPath.substring(2);
         }
-        boolean isAbsolute = cleanPath.startsWith("/");
         File f = new File(cleanPath);
-        // 优先用 getCanonicalPath 解析 .. 和符号链接，失败时降级到手动处理
-        String abs;
         try {
-            abs = f.getCanonicalPath();
+            return f.getCanonicalPath().replace("\\", "/");
         } catch (Exception e) {
-            abs = f.getAbsolutePath();
+            return f.getAbsolutePath().replace("\\", "/");
         }
-        // 简单的 ".." 处理（作为 fallback 保护）
-        String[] parts = abs.replace("\\", "/").split("/");
-        java.util.ArrayList<String> result = new java.util.ArrayList<>();
-        for (String p : parts) {
-            if (p.equals("..") && result.size() > 0 && !result.get(result.size()-1).equals("..")) {
-                result.remove(result.size() - 1);
-            } else if (!p.isEmpty()) {
-                result.add(p);
-            }
-        }
-        StringBuilder sb = new StringBuilder();
-        if (isAbsolute) {
-            sb.append("/");
-        }
-        for (int i = 0; i < result.size(); i++) {
-            if (i > 0 || isAbsolute) sb.append("/");
-            sb.append(result.get(i));
-        }
-        return sb.toString();
     }
 }

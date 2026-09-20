@@ -799,8 +799,10 @@ public class MainController {
         lastGameW = gameW;
         lastGameH = gameH;
 
-        int screenW = Gdx.graphics.getWidth();
-        int screenH = Gdx.graphics.getHeight();
+        // [desktop] glViewport 的单位是帧缓冲像素，不是逻辑像素。
+        // macOS Retina 上帧缓冲是逻辑尺寸的 2 倍，用 getWidth() 会让视口只覆盖左下四分之一。
+        int screenW = Gdx.graphics.getBackBufferWidth();
+        int screenH = Gdx.graphics.getBackBufferHeight();
         float targetAspect = (float) gameW / gameH;
         float screenAspect = (float) screenW / screenH;
 

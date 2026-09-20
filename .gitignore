@@ -179,3 +179,6 @@ beatoraja-master/
 walkure-offline/
 android/src/main/assets/
 .workbuddy/
+
+# desktop 模块构建产物
+desktop/build/

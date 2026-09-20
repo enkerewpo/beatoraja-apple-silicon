@@ -1,0 +1,52 @@
+// 桌面端（LWJGL3）模块。
+// 存在的理由：上游 beatoraja 用 libGDX 1.9.9 + LWJGL2，而 LWJGL2 从无也永不会有
+// arm64 macOS 支持；本 fork 的 core 已迁到 libGDX 1.14，只差一个桌面后端。
+plugins { id 'java' }
+
+sourceSets.main.java.srcDirs = ['src/main/java']
+
+dependencies {
+    implementation project(':core')
+    implementation "com.badlogicgames.gdx:gdx-backend-lwjgl3:$gdxVersion"
+    // natives-desktop 在 1.14 里已包含 macOS arm64
+    runtimeOnly "com.badlogicgames.gdx:gdx-platform:$gdxVersion:natives-desktop"
+    runtimeOnly "com.badlogicgames.gdx:gdx-freetype-platform:$gdxVersion:natives-desktop"
+    implementation "com.badlogicgames.gdx-controllers:gdx-controllers-desktop:$gdxControllersVersion"
+    // BGA：VideoPlayerCreator 在桌面端按类名反射查找 com.badlogic.gdx.video.VideoPlayerDesktop，
+    // 该类由官方 gdx-video-lwjgl3 提供（本仓库 vendored 的 gdx-video-core 同为 1.3.4，接口一致）。
+    implementation "com.badlogicgames.gdx-video:gdx-video-lwjgl3:$gdxVideoVersion"
+    implementation 'org.xerial:sqlite-jdbc:3.50.1.0'
+    // 移植过来的 JDBC accessor 用 commons-dbutils 做 ResultSet 映射（core 也依赖它）
+    implementation 'commons-dbutils:commons-dbutils:1.8.1'
+}
+
+tasks.register('run', JavaExec) {
+    group = 'application'
+    mainClass = 'com.starxh.beatoraja.desktop.DesktopLauncher'
+    classpath = sourceSets.main.runtimeClasspath
+    standardInput = System.in
+    // 在现有 beatoraja 安装目录下运行，才能读到 config.json / skin / songdata.db
+    // 音游对 GC 停顿极其敏感：载入上千个键音后进入游玩，G1 的一次回收就会掉帧。
+    // ZGC 是亚毫秒停顿的并发收集器，正适合这种场景。堆预先开大，避免运行中扩容。
+    jvmArgs '-Xms2g', '-Xmx4g', '-XX:+UseZGC'
+    def orajaHome = System.getProperty('user.home') + '/Games/beatoraja0.8.8-modernchic'
+    workingDir = file(orajaHome)
+    systemProperty 'beatoraja.root', orajaHome
+    // macOS 上 GLFW 要求在进程的第一个线程运行。libGDX 1.14 的 lwjgl3 后端
+    // 并不自带 StartOnFirstThreadHelper，必须显式传这个 JVM 参数。
+    // 注意：上游那套 JavaFX 配置窗口不能加此参数（会死锁），但本模块是纯 LWJGL3，无此冲突。
+    if (org.gradle.internal.os.OperatingSystem.current().isMacOsX()) {
+        jvmArgs '-XstartOnFirstThread'
+    }
+}
+
+tasks.register('audioBench', JavaExec) {
+    group = 'verification'
+    description = '在原生 arm64 下测量 ogg 切片的解码加载耗时与并发发音丢声情况'
+    mainClass = 'com.starxh.beatoraja.desktop.AudioBenchmark'
+    classpath = sourceSets.main.runtimeClasspath
+    if (org.gradle.internal.os.OperatingSystem.current().isMacOsX()) {
+        jvmArgs '-XstartOnFirstThread'
+    }
+    systemProperty 'oraja.songdir', project.findProperty('oraja.songdir') ?: ''
+}
