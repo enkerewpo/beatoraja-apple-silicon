@@ -152,6 +152,8 @@ endlessdream-upstream-src/
 gradle-app.setting
 gwt-unitCache/
 hs_err_pid*
+launcher/.build/
+launcher/build/
 libgdx-oboe.zip
 local.properties
 nb-configuration.xml

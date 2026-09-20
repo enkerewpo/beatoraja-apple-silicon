@@ -1,7 +1,12 @@
 <div align="center">
-  <img src="desktop/packaging/icon.png" width="128" alt="beatoraja Apple Silicon">
+  <img src="desktop/packaging/icon.png" width="112" alt="beatoraja Apple Silicon">
   <h1>beatoraja — Apple Silicon</h1>
   <p>A native LWJGL3 desktop backend for beatoraja. Runs on Apple Silicon without Rosetta.</p>
+  <br>
+  <img src="docs/screenshots/select.png" width="760" alt="Song select running natively on Apple Silicon">
+  <br><br>
+  <img src="docs/screenshots/launcher.png" width="340" alt="Launcher">
+  <p><sub>The launcher is a small native AppKit app, not the upstream JavaFX window.</sub></p>
 </div>
 
 ---
@@ -95,6 +100,27 @@ This was not always true. `SongUtils.crc32` in this fork had picked up two steps
 - `DesktopLauncher` — LWJGL3 entry point
 - `JdbcSongDatabaseAccessor` — JDBC song database reader and writer
 - `SongScanner` / `ScanTool` — song library scanning, also runnable headless
+
+### New `launcher/` module
+
+A small native AppKit app that edits `config.json` and starts the game.
+
+Upstream shows a JavaFX configuration window before the game; the Android fork this is built
+on stripped that out entirely, so it had to be rebuilt. It could not simply be ported back:
+GLFW requires the first thread of the process on macOS (`-XstartOnFirstThread`) and so does
+any AppKit or JavaFX event loop, so the two cannot share a process — which is exactly why
+the upstream window deadlocks the LWJGL3 backend. A separate process was mandatory either
+way, so a native one is both smaller and better behaved than bundling JavaFX.
+
+AppKit rather than SwiftUI because SwiftUI's property wrappers are macros in current SDKs
+and the macro plugins ship only with Xcode, not the Command Line Tools.
+
+```bash
+cd launcher && ./build-app.sh
+```
+
+Produces `launcher/build/BeatorajaLauncher.app` — 260 KB, native arm64. Put it next to
+`beatoraja.app` and it will find the game.
 - `StubScoreDatabaseAccessor` — score database stub, not implemented
 - `AudioBenchmark` — the audio verification above
 
@@ -114,7 +140,6 @@ This was not always true. `SongUtils.crc32` in this fork had picked up two steps
 ## TODO
 
 - [ ] **Score database** — currently a stub, scores are not saved
-- [ ] **Config window** — the upstream JavaFX launcher has not been adapted
 - [ ] **Skin switching** — needs in-game verification
 - [ ] **Frame pacing** — vsync is not reliably honoured on macOS in windowed mode; currently capped explicitly
 - [ ] **Intel Mac verification**
