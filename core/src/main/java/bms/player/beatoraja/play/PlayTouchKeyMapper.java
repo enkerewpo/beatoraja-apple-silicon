@@ -47,17 +47,29 @@ public class PlayTouchKeyMapper implements InputProcessor, Disposable {
 
     private final Matrix4 oldProj = new Matrix4();
 
+    // ─── 逐帧复用的触摸区域缓存（禁止在 render 里分配对象）───
+    /** 本帧每条轨道在 Stage 坐标系下的矩形 */
+    private Rectangle[] laneRects = new Rectangle[0];
+    /** 轨道沿"堆叠轴"排序后的 lane 下标 */
+    private int[] laneOrder = new int[0];
+    /** lane 下标 → 它在堆叠轴上的次序（laneOrder 的反查表） */
+    private int[] lanePos = new int[0];
+
+    // ─── SkinNote 缓存（避免逐帧遍历全部皮肤对象）───
+    private SkinNote skinNoteCache;
+    private PlaySkin skinForNoteCache;
+
     private static final Color SCRATCH_COLOR = new Color(0.8f, 0.2f, 0.2f, 0.0f);
     private static final Color WHITE_KEY_COLOR = new Color(0.9f, 0.9f, 0.9f, 0.0f);
     private static final Color BLACK_KEY_COLOR = new Color(0.3f, 0.3f, 0.3f, 0.0f);
     private static final Color LABEL_COLOR = new Color(1.0f, 1.0f, 1.0f, 0.0f);
 
-    private boolean isPortrait = false;
-    private static final int OP_PORTRAIT = 1101;
-
-    // 相邻 lane Y 方向间隙小于此值（px）时仍用完整 15% 扩展（侧排 lane 不受限制）；
-    // 大于则把扩展边界限制到相邻 lane 中线，防止双键同时触发
-    private static final float MIN_GAP_FOR_MIDLINE = 10f;
+    /**
+     * 触摸区域扩展上限（非堆叠轴，即轨道长度方向）：竖屏 5%、横屏 15% 的逻辑高度。
+     * 该轴上没有相邻轨道，多做扩展只是给玩家容错，不会误触别的键。
+     */
+    private static final float ALONG_EXTENSION_PORTRAIT = 0.05f;
+    private static final float ALONG_EXTENSION_LANDSCAPE = 0.15f;
 
     public PlayTouchKeyMapper(BMSPlayer player, Resolution resolution, BMSPlayerInputProcessor inputProcessor, LaneProperty laneProperty) {
         this.player = player;
@@ -90,6 +102,17 @@ public class PlayTouchKeyMapper implements InputProcessor, Disposable {
             return;
         }
 
+        // 皮肤在本局内不会变，把 SkinNote 引用缓存下来 —— render() 每帧都要读轨道矩形，
+        // 逐帧遍历 getAllSkinObjects() 会白白产生迭代器分配与全表扫描。
+        skinForNoteCache = skin;
+        skinNoteCache = null;
+        for (SkinObject obj : skin.getAllSkinObjects()) {
+            if (obj instanceof SkinNote) {
+                skinNoteCache = (SkinNote) obj;
+                break;
+            }
+        }
+
         Rectangle[] laneRegions = skin.getLaneRegion();
         if (laneRegions == null || laneRegions.length == 0) {
             Gdx.app.log("PlayTouchKeyMapper", "Lane region not available, skip update");
@@ -110,32 +133,55 @@ public class PlayTouchKeyMapper implements InputProcessor, Disposable {
     }
 
     /**
-     * 动态同步轨道位置到触摸区域，实现“跟着 LaneRenderer 走”
+     * 动态同步轨道位置到触摸区域，实现跟随 LaneRenderer 走
+     *
+     * <p>皮肤里每条轨道矩形的相邻边之间留着一条"分割线"宽度的间隙（GenericTheme for
+     * Touchscreen：竖屏 6px、横屏 3px，分割线画在间隙里而不是轨道矩形内）。触摸落在这条
+     * 间隙上时任何轨道都不命中，手感上就是一条"真空带"。这里把间隙按 50/50 分给两侧轨道，
+     * 使相邻触摸区域无缝衔接。</p>
+     *
+     * <p>横竖屏通用：轨道在哪根轴上铺开，就沿哪根轴分间隙 —— 竖屏沿 Y（轨道上下堆叠，
+     * 间隙在 Y），横屏沿 X（轨道左右并排，间隙在 X）。另一根轴（轨道长度方向）保持宽松
+     * 扩展，只做屏幕裁剪。</p>
      */
     private void updateRegionsFromLanes() {
         if (!regionsInitialized) return;
         PlaySkin skin = (PlaySkin) player.getSkin();
         if (skin == null) return;
 
-        SkinNote skinNote = null;
-        for (SkinObject obj : skin.getAllSkinObjects()) {
-            if (obj instanceof SkinNote) {
-                skinNote = (SkinNote) obj;
-                break;
+        // SkinNote 正常由 updateRegionsFromSkin() 缓存；皮肤被替换时这里兜底重找一次
+        if (skinNoteCache == null || skinForNoteCache != skin) {
+            skinForNoteCache = skin;
+            skinNoteCache = null;
+            for (SkinObject obj : skin.getAllSkinObjects()) {
+                if (obj instanceof SkinNote) {
+                    skinNoteCache = (SkinNote) obj;
+                    break;
+                }
             }
         }
+        SkinNote skinNote = skinNoteCache;
         if (skinNote == null) return;
 
         SkinNote.SkinLane[] lanes = skinNote.getLanes();
-        if (lanes == null || lanes.length != keyButtons.length) return;
+        if (lanes == null || lanes.length == 0 || lanes.length != keyButtons.length) return;
 
-        boolean isPortrait = player.getLanerender().isPortrait();
-        float touchExtension = isPortrait ? logicH * 0.05f : logicH * 0.15f;
+        final boolean portrait = player.getLanerender().isPortrait();
+        // 轨道长度方向（非堆叠轴）的容错扩展：沿用旧实现的两个档位
+        final float alongExtension = logicH * (portrait ? ALONG_EXTENSION_PORTRAIT : ALONG_EXTENSION_LANDSCAPE);
 
+        if (laneRects.length != lanes.length) {
+            laneRects = new Rectangle[lanes.length];
+            for (int i = 0; i < laneRects.length; i++) {
+                laneRects[i] = new Rectangle();
+            }
+            laneOrder = new int[lanes.length];
+            lanePos = new int[lanes.length];
+        }
+
+        // 1) 先算出每条轨道本帧在 Stage 坐标系下的矩形（含 LIFT / LaneCover 等皮肤偏移）
         for (int i = 0; i < lanes.length; i++) {
-            Rectangle r = lanes[i].region; // 获取当前帧的轨道基础区域
-
-            // 计算所有偏移量的总和（如 LIFT、LaneCover 等）
+            Rectangle r = lanes[i].region; // 当前帧的轨道基础区域
             float offsetX = 0;
             float offsetY = 0;
             for (SkinObject.SkinOffset o : lanes[i].getSkinOffsets()) {
@@ -144,71 +190,103 @@ public class PlayTouchKeyMapper implements InputProcessor, Disposable {
                     offsetY += o.y;
                 }
             }
-
-            float stageY;
-            float finalX = r.x + offsetX;
-            float finalY = r.y + offsetY;
-
-            if (isPortrait) {
-                // 竖屏逻辑：映射 Stage y=0 -> 右，y=1080 -> 左
-                // 此时 finalY 包含 LIFT 等带来的偏移。直接使用以实现“跟着轨道走”。
-                stageY = finalY;
+            if (portrait) {
+                // 竖屏：Stage Y 与皮肤 Y 同向（屏幕坐标的翻转已在输入侧完成）
+                laneRects[i].set(r.x + offsetX, r.y + offsetY, r.width, r.height);
             } else {
-                // 横屏逻辑：正常 Y 轴翻转，同时应用偏移
-                stageY = logicH - finalY - r.height;
+                // 横屏：Y 轴翻转之后再应用偏移
+                laneRects[i].set(r.x + offsetX, logicH - (r.y + offsetY) - r.height, r.width, r.height);
+            }
+        }
+
+        // 2) 判定堆叠轴：轨道中心在哪个轴上铺得开，就说明轨道在哪个轴上相邻
+        float minCx = Float.MAX_VALUE, maxCx = -Float.MAX_VALUE;
+        float minCy = Float.MAX_VALUE, maxCy = -Float.MAX_VALUE;
+        for (int i = 0; i < laneRects.length; i++) {
+            Rectangle r = laneRects[i];
+            final float cx = r.x + r.width * 0.5f;
+            final float cy = r.y + r.height * 0.5f;
+            if (cx < minCx) minCx = cx;
+            if (cx > maxCx) maxCx = cx;
+            if (cy < minCy) minCy = cy;
+            if (cy > maxCy) maxCy = cy;
+        }
+        final boolean stackAlongY = (maxCy - minCy) >= (maxCx - minCx);
+
+        // 3) 沿堆叠轴排序：皮肤的可视次序与 lane 下标常常不同（7K 竖屏 order = {7,6,5,4,3,2,1,8}，
+        //    相邻下标并不相邻），必须先按坐标排序才能找到真正的邻居。8 个元素插入排序，零分配。
+        for (int i = 0; i < laneOrder.length; i++) {
+            laneOrder[i] = i;
+        }
+        for (int i = 1; i < laneOrder.length; i++) {
+            final int cur = laneOrder[i];
+            final float key = stackAlongY ? laneRects[cur].y : laneRects[cur].x;
+            int j = i - 1;
+            while (j >= 0 && (stackAlongY ? laneRects[laneOrder[j]].y : laneRects[laneOrder[j]].x) > key) {
+                laneOrder[j + 1] = laneOrder[j];
+                j--;
+            }
+            laneOrder[j + 1] = cur;
+        }
+        for (int p = 0; p < laneOrder.length; p++) {
+            lanePos[laneOrder[p]] = p;
+        }
+
+        // 4) 分割线间隙按 50/50 分给两侧，写入触摸区域
+        for (int i = 0; i < lanes.length; i++) {
+            Rectangle r = laneRects[i];
+            final int p = lanePos[i];
+            // 最外侧没有相邻轨道，沿用宽松扩展（超出屏幕的部分会被裁掉）
+            float minus = alongExtension;
+            float plus = alongExtension;
+            if (p > 0) {
+                minus = gapHalf(laneRects[laneOrder[p - 1]], r, stackAlongY);
+            }
+            if (p < laneOrder.length - 1) {
+                plus = gapHalf(r, laneRects[laneOrder[p + 1]], stackAlongY);
             }
 
-            // 触摸区域扩展：横屏下尝试扩展到相邻 lane 中线
-            // 仅在 Y 方向上有"足够大"的间隙时限制扩展（侧排 lane 不受影响）
-            float extendUp = 0;
-            float extendDown = 0;
-            if (!isPortrait) {
-                extendUp = touchExtension;
-                extendDown = touchExtension;
-
-                if (i > 0) {
-                    float prevBottom = computeStageBottom(lanes[i - 1], isPortrait);
-                    float gap = stageY - prevBottom;
-                    if (gap > MIN_GAP_FOR_MIDLINE) {
-                        extendUp = Math.min(touchExtension, gap / 2f);
-                    }
-                }
-                if (i < lanes.length - 1) {
-                    float nextTop = computeStageTop(lanes[i + 1], isPortrait);
-                    float gap = nextTop - (stageY + r.height);
-                    if (gap > MIN_GAP_FOR_MIDLINE) {
-                        extendDown = Math.min(touchExtension, gap / 2f);
-                    }
-                }
+            float x, y, w, h;
+            if (stackAlongY) {
+                x = r.x - alongExtension;
+                w = r.width + alongExtension * 2f;
+                y = r.y - minus;
+                h = r.height + minus + plus;
+            } else {
+                y = r.y - alongExtension;
+                h = r.height + alongExtension * 2f;
+                x = r.x - minus;
+                w = r.width + minus + plus;
             }
-
-            float extendedY = stageY - extendUp;
-            float extendedHeight = r.height + extendUp + extendDown;
 
             // 确保不超出屏幕边界
-            if (extendedY < 0) {
-                extendedHeight += extendedY;
-                extendedY = 0;
-            }
-            if (extendedY + extendedHeight > logicH) {
-                extendedHeight = logicH - extendedY;
-            }
+            if (x < 0) { w += x; x = 0; }
+            if (y < 0) { h += y; y = 0; }
+            if (x + w > logicW) w = logicW - x;
+            if (y + h > logicH) h = logicH - y;
+            if (w < 0) w = 0;
+            if (h < 0) h = 0;
 
-            keyButtons[i].updateBounds(finalX, extendedY, r.width, extendedHeight);
+            keyButtons[i].updateBounds(x, y, w, h);
         }
     }
 
-    private float computeStageTop(SkinNote.SkinLane lane, boolean isPortrait) {
-        float offsetY = 0;
-        for (SkinObject.SkinOffset o : lane.getSkinOffsets()) {
-            if (o != null) offsetY += o.y;
+    /**
+     * 相邻两轨之间"分割线间隙"的一半，用于 50/50 对分。
+     *
+     * @param a          堆叠轴上靠前的一条轨道
+     * @param b          堆叠轴上靠后的一条轨道
+     * @param stackAlongY 堆叠轴是否为 Y
+     * @return 间隙的一半；两轨已相接或重叠时返回 0（本就无缝）。
+     *         上限取较薄的一条轨道厚度，避免异常皮肤把触摸区域拉得过长而误触。
+     */
+    private float gapHalf(Rectangle a, Rectangle b, boolean stackAlongY) {
+        final float gap = stackAlongY ? (b.y - (a.y + a.height)) : (b.x - (a.x + a.width));
+        if (gap <= 0) {
+            return 0;
         }
-        float finalY = lane.region.y + offsetY;
-        return isPortrait ? finalY : logicH - finalY - lane.region.height;
-    }
-
-    private float computeStageBottom(SkinNote.SkinLane lane, boolean isPortrait) {
-        return computeStageTop(lane, isPortrait) + lane.region.height;
+        final float cap = stackAlongY ? Math.min(a.height, b.height) : Math.min(a.width, b.width);
+        return Math.min(gap * 0.5f, cap);
     }
 
     /**

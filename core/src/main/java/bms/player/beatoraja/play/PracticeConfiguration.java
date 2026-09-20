@@ -152,6 +152,7 @@ public final class PracticeConfiguration {
 		// （旧 BitmapFont 被 dispose、生成新对象），缓存的旧引用会画不出任何文字
 		titlefont = state.main.getSystemFont18();
 		updateLayoutMode(state.getSkin());
+		updateTextAlpha(state);
 		float x = r.x + r.width / 8;
 		float y = r.y + r.height * 7 / 8;
 		if (textAngle != 0f) {
@@ -192,7 +193,10 @@ public final class PracticeConfiguration {
 	private Skin layoutSkin;
 	/** 触摸版皮肤（GenericTheme for Touchscreen 等）：叠加在最上层 + 半透明 + 不画密度图 */
 	private boolean touchScreen;
-	/** 文字透明度：触摸皮肤 0.2，其他皮肤 1 */
+	/**
+	 * 文字透明度：触摸皮肤演奏中 0.2，其他皮肤 1。
+	 * 每帧由 {@link #updateTextAlpha(MainState)} 决定 —— 刚进练习模式时是全不透明的。
+	 */
 	private float textAlpha = 1f;
 	/** 是否绘制 note 分布图 */
 	private boolean drawGraph = true;
@@ -206,7 +210,8 @@ public final class PracticeConfiguration {
 	 *
 	 * <p>触摸版皮肤的轨道背景是一整块<b>不透明</b>矩形（竖屏时铺满全屏），
 	 * 参数面板画在 BGA 层会被它整块盖住 —— 这就是"练习模式看不到参数调整"的原因。
-	 * 配合 15% 透明度与去掉密度图，叠加在最上层也不会太挡 note。</p>
+	 * 配合演奏开始后的 20% 透明度（调参数阶段仍是 100%）与去掉密度图，
+	 * 叠加在最上层也不会太挡 note。</p>
 	 */
 	public boolean isOverlayOnTop(Skin skin) {
 		updateLayoutMode(skin);
@@ -219,9 +224,25 @@ public final class PracticeConfiguration {
 		}
 		layoutSkin = skin;
 		touchScreen = isTouchscreenSkin(skin);
-		textAlpha = touchScreen ? 0.20f : 1f;
 		drawGraph = !touchScreen;
 		textAngle = touchScreen && isPortraitLayout(skin) ? 270f : 0f;
+	}
+
+	/**
+	 * 更新参数文字透明度：触摸版皮肤演奏中 20%（面板叠加在屏幕最上层，太亮会挡住 note），
+	 * 但<b>刚进入练习模式、还在调参数</b>时必须给足 100%，否则参数看不清。
+	 *
+	 * <p>判据取演奏状态：{@code BMSPlayer.getState() >= STATE_READY}（GET READY 起）才降回
+	 * 20%；之前的 {@code STATE_PRELOAD} / {@code STATE_PRACTICE}（调参数）都保持 100%。
+	 * 练习结束（FAILED / FINISHED）后 BMSPlayer 会回到 {@code STATE_PRACTICE} 重新调参，
+	 * 那时自动恢复 100%。非触摸皮肤恒为 100%。</p>
+	 */
+	private void updateTextAlpha(MainState state) {
+		textAlpha = touchScreen && isPlayStarted(state) ? 0.20f : 1f;
+	}
+
+	private static boolean isPlayStarted(MainState state) {
+		return (state instanceof BMSPlayer) && ((BMSPlayer) state).getState() >= BMSPlayer.STATE_READY;
 	}
 
 	/** 皮肤名里带 Touchscreen 的按触摸版处理 */
@@ -276,7 +297,7 @@ public final class PracticeConfiguration {
 		sprite.draw(titlefont, textLayout, px, py, px, py, textAngle);
 	}
 
-	/** 按 textAlpha 调暗（触摸皮肤 20% 不透明度） */
+	/** 按 textAlpha 调暗（触摸皮肤演奏中 20% 不透明度） */
 	private Color tint(Color base) {
 		if (textAlpha >= 1f) {
 			return base;

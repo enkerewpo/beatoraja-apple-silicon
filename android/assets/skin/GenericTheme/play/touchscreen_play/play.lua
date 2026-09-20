@@ -424,7 +424,9 @@ local function main(keysNumber)
 		geo.lane.each_x = {}
 
 		-- Cumulative distribution with FIXED separator width to ensure seamless gaps
-		local sep_w = 6
+		-- 竖屏分割线间隙（也是相邻轨道矩形之间的空隙）。2026-09-20 应用户要求 6 → 5。
+		-- 注意：横屏走另一条分支，间隙是写死的 3（见下方 geo.lane.separateline_w = 3）。
+		local sep_w = 5
 		geo.lane.separateline_w = sep_w
 		local num_seps = #geo.lane.order - 1
 		local total_lane_w = 1080 - (num_seps * sep_w)
@@ -3051,7 +3053,11 @@ local function main(keysNumber)
 			local size_w_final = size_w
 			local size_h_final = size_h
 			if isPortraitLayout() then
-				size_h_final = geo.lane.each_w[i] * 2.0
+				-- 竖屏：bomb 直径按该条轨道的厚度算，并叠加与横屏同一个
+				-- "Bomb size offset"（offset.bomb.w，单位 px）皮肤选项，
+				-- 这样竖屏也能像横屏一样在皮肤设置里调 bomb 大小。
+				-- offset = 0（默认）时为 2.5 × 轨道厚度。
+				size_h_final = geo.lane.each_w[i] * 2.5 + offset.bomb.w
 				size_w_final = size_h_final
 			end
 			local bomb_y_offset = 0

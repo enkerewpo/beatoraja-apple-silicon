@@ -41,7 +41,7 @@
 | 项 | 触摸版 | 其他皮肤 |
 | --- | --- | --- |
 | 绘制位置 | 皮肤画完后叠加（`MainController` → `BMSPlayer#drawPracticeOverlay`） | `SkinBGA` 的 BGA 层（在 lane/notes 之下，上游行为） |
-| 文字透明度 | 15% | 100% |
+| 文字透明度 | 调参数阶段 100%，`STATE_READY`（GET READY）起 20% | 100% |
 | note 分布图 | 不绘制 | 绘制 |
 | 文字旋转 | 竖屏（Layout 选项 = Portrait）时 270° | 0° |
 
@@ -88,8 +88,12 @@
 
 ## 四、当前状态与可调项
 
-- 竖屏文字方向、位置已确认：锚点在右边缘（`r.x + r.width - 40`，文字块向左展开），
-  透明度 15%（原 30%，2026-09-18 应用户要求调低）。
+- 竖屏文字方向、位置已确认：锚点在右边缘（`r.x + r.width - 40`，文字块向左展开）。
+- **透明度按演奏状态两档**（2026-09-20 应用户要求）：刚进练习模式 / 回到参数调整
+  （`STATE_PRELOAD`、`STATE_PRACTICE`）为 **100%**，`BMSPlayer.getState() >= STATE_READY`
+  （GET READY 起）降为 **20%**。实现见 `PracticeConfiguration#updateTextAlpha(state)`，
+  在 `draw()` 里每帧调用（`updateLayoutMode` 是 skin 变化才更新的缓存，不能把 alpha 放进去）。
+  练习结束后 `BMSPlayer` 会回到 `STATE_PRACTICE` 重新调参，此时自动恢复 100%。
 - 若想上下挪：改锚点 y（`r.y + r.height * 7 / 8`）—— 竖屏下 y 才是设备的上下方向。
 - 若想让面板"在轨道之下"（不再是叠加层）：需要给皮肤一个可在图层顺序中摆放的
   面板对象（例如新增一个 play 皮肤专用的 dst id / 皮肤字段，在 `play.lua` 里放到
