@@ -167,13 +167,9 @@ public final class DesktopLauncher {
             final PlayerConfig player = PlayerConfig.readPlayerConfig(name, null);
 
             // core's MainLoader only keeps the injection points; each platform supplies the
-            // implementation. Use a separate database file: upstream beatoraja 0.8.8 and this
-            // fork disagree on SongUtils.crc32, so the same directory hashes differently and
-            // sharing one database makes the hierarchy mismatch and every chart vanish.
-            File db = new File(root, "songdata-desktop.db");
-            if (!db.exists()) {
-                db = new File(root, "songdata.db");
-            }
+            // implementation. SongUtils.crc32 now matches upstream, so a songdata.db written
+            // by upstream beatoraja can be read directly with no migration.
+            final File db = new File(root, "songdata.db");
             MainLoader.setSongDatabaseAccessor(
                     new JdbcSongDatabaseAccessor(db.getAbsolutePath(), config.getBmsroot()));
             bms.player.beatoraja.ScoreDatabaseAccessor.setFactory(

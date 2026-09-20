@@ -76,11 +76,9 @@ Produces `desktop/build/jpackage/beatoraja.app` with an embedded JRE — double-
 
 ### Song database compatibility
 
-**This fork's `SongUtils.crc32` is not compatible with a `songdata.db` built by upstream beatoraja 0.8.8.** The same directory hashes to a different CRC, so sharing one database makes the folder hierarchy mismatch and every chart disappear.
+A `songdata.db` written by upstream beatoraja is read directly, no migration needed.
 
-The desktop build reads `songdata-desktop.db`, falling back to `songdata.db` if absent. The original database is left untouched and both can coexist. Migrating means recomputing `folder.parent`, `song.folder` and `song.parent` with this fork's algorithm.
-
-Song scanning is not implemented yet, so the database currently has to be built by upstream beatoraja and then migrated.
+This was not always true. `SongUtils.crc32` in this fork had picked up two steps that upstream does not do — rebasing the path against the *parent* of `bmspath`, and converting `/` to `\\`. Both change the hash, so the same directory produced a different CRC, the folder hierarchy stopped matching and every chart disappeared. Upstream hashes the path as given, forward slashes preserved, followed by a backslash and a NUL byte, with the standard CRC-32 polynomial. Verified against a database built by beatoraja 0.8.8: all six chart folders and the root hash identically.
 
 ## What this repository changes
 
